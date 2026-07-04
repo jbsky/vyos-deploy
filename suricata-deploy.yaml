@@ -1,0 +1,149 @@
+# ansible-playbook suricata-deploy.yaml -i <ton-inventaire>
+#
+# Déploie la configuration Suricata (IPS NFQUEUE) sur le container Podman
+# de VyOS, ainsi que le script de mise à jour des règles (task-scheduler).
+#
+# Les fichiers source sont dans etc/suricata/ (versionnés dans git). Ce
+# repo ne fournit pas d'inventaire -- vois le README pour cibler le groupe
+# Ansible "vyos" depuis ton propre inventaire (usage standalone ou en
+# submodule Git).
+#
+# Le fichier suricata.rules (téléchargé quotidiennement par suricata-update)
+# n'est PAS géré ici -- c'est un artefact généré, pas une source de vérité.
+#
+# Container et IP (réseau podman, mode NFQUEUE host networking) :
+#   suricata → allow-host-networks, pas d'IP dediee (NFQUEUE exige le netns hote)
+#
+# Tags disponibles :
+#   config   → copier les fichiers de conf + local.rules
+#   script   → copier le script de mise à jour des règles (task-scheduler)
+#   service  → redémarrer le container suricata
+#   check    → vérifier que le container tourne
+#
+# Exemples :
+#   ansible-playbook suricata-deploy.yaml
+#   ansible-playbook suricata-deploy.yaml --tags config
+#   ansible-playbook suricata-deploy.yaml --tags script
+#   ansible-playbook suricata-deploy.yaml --tags check
+#   ansible-playbook suricata-deploy.yaml --check --diff --tags config
+
+- name: Deploy Suricata config to VyOS container
+  hosts: vyos
+  gather_facts: false
+  vars:
+    vyos_base: /config/containers/suricata
+    script_dest: /config/scripts/suricata-update.sh
+
+  pre_tasks:
+    # suricata_conf n'est PAS mis dans vars: ci-dessus : les vars de play ont
+    # une priorite plus haute que les group_vars/host_vars d'inventaire, ce
+    # qui empecherait un inventaire de fournir sa propre valeur. Le default()
+    # ci-dessous ne s'applique que si rien (inventaire ni -e) ne le fournit.
+    - name: Resolve suricata_conf (inventory override wins over bundled example)
+      ansible.builtin.set_fact:
+        suricata_conf: "{{ suricata_conf | default(playbook_dir + '/etc/suricata') }}"
+      delegate_to: localhost
+      tags: always
+
+    - name: Check source directory exists
+      ansible.builtin.stat:
+        path: "{{ suricata_conf }}/suricata.yaml"
+      delegate_to: localhost
+      register: _suricata_conf_check
+      tags: [suricata_deploy, config, script, service, check]
+
+    - name: Fail if source directory missing
+      ansible.builtin.fail:
+        msg: "{{ suricata_conf }}/suricata.yaml not found."
+      when: not _suricata_conf_check.stat.exists
+      tags: [suricata_deploy, config, script, service, check]
+
+  tasks:
+    # ── Config files (etc/) ──────────────────────────────────────
+    # Pas de delegate_to/become explicite : ansible_become: true (host_vars)
+    # s'applique par defaut, et owner/group/mode directement sur copy
+    # remplacent les anciennes taches "Fix ... ownership/permissions"
+    # separees -- --check/--diff fonctionnent aussi nativement.
+    - name: Deploy etc/ config files
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/{{ item }}"
+        dest: "{{ vyos_base }}/etc/{{ item }}"
+        mode: "0644"
+      loop:
+        - suricata.yaml
+        - disable.conf
+        - modify.conf
+        - classification.config
+        - reference.config
+        - threshold.config
+        - update.yaml
+        - suricata.start
+      notify: Restart suricata
+      tags: [config]
+
+    # ── Custom rules ───────────────────────────────────────────────
+    - name: Deploy local.rules
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/rules/local.rules"
+        dest: "{{ vyos_base }}/rules/local.rules"
+        owner: "8000"
+        group: "8000"
+      notify: Restart suricata
+      tags: [config]
+
+    # ── Update script (VyOS task-scheduler, daily rule refresh) ────
+    - name: Deploy suricata-update.sh
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/suricata-update.sh"
+        dest: "{{ script_dest }}"
+        owner: radius_user
+        group: vyattacfg
+        mode: "0775"
+      tags: [script]
+
+  handlers:
+    - name: Restart suricata
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container suricata
+      listen: Restart suricata
+      tags: [service]
+
+    - name: Wait for suricata to be ready
+      # FROM scratch = no shell/podman exec possible. NFQUEUE host-networking
+      # exposes no dedicated port to wait_for either -- use VyOS's own
+      # "show container" op-command (same wrapper as the restart above,
+      # no nested ssh call, no remote quoting to get wrong).
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show container
+      register: _suricata_running
+      retries: 6
+      delay: 5
+      until: "'suricata' in _suricata_running.stdout and 'Up' in _suricata_running.stdout"
+      changed_when: false
+      failed_when: false
+      listen: Restart suricata
+      tags: [service]
+
+  post_tasks:
+    - name: Flush handlers to restart container now
+      ansible.builtin.meta: flush_handlers
+      tags: [check]
+
+    - name: Check suricata container is running
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show container
+      register: _suricata_status
+      changed_when: false
+      failed_when: false
+      tags: [check]
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ _suricata_status.stdout_lines | select('search', 'suricata') | list }}"
+      tags: [check]
+
+    - name: Fail if suricata isn't up
+      ansible.builtin.fail:
+        msg: "suricata container not found running: {{ _suricata_status.stdout }}"
+      when: "'suricata' not in _suricata_status.stdout or 'Up' not in (_suricata_status.stdout_lines | select('search', 'suricata') | first | default(''))"
+      tags: [check]

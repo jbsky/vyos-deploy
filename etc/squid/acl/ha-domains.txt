@@ -1,0 +1,2 @@
+# Exemple -- domaines autorises pour le device "home_assistant"
+.example-iot-vendor.com

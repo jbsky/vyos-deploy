@@ -1,0 +1,73 @@
+server ::/0 { bogus yes ; };
+
+// Exemple -- remplace par les plages de ton propre reseau.
+acl "trusted" {
+127.0.0.1         ;
+172.20.2.1        ; // gateway du container bind9 (reseau podman)
+192.168.1.0/24    ; // exemple LAN principal
+192.168.10.0/24   ; // exemple VLAN secondaire
+10.42.0.0/16      ; // exemple reseau pods K3s
+}                 ;
+
+options {
+directory "/var/cache/bind";
+empty-zones-enable no        ;
+
+# Hardening: masquer la version et reduire les informations dans les reponses
+version "not disclosed"      ;
+hostname "not disclosed"     ;
+server-id "not disclosed"    ;
+minimal-responses yes        ;
+
+# Forwarders avec controle strict
+forwarders {
+1.1.1.1      ;        # Cloudflare
+9.9.9.9      ;        # Quad9 (focus securite)
+8.8.8.8      ;        # Google backup
+}            ;
+forward only ;      # Utilise forwarders puis root si necessaire
+
+//========================================================================
+// If BIND logs error messages about the root key being expired,
+// you will need to update your keys. See https://www.isc.org/bind-keys
+//========================================================================
+dnssec-validation auto                                                     ;
+auth-nxdomain no                                                           ;    # conform to RFC1035
+listen-on { any                                                            ; };
+allow-query { any                                                          ; };
+allow-recursion { trusted                                                  ; };
+allow-query-cache { trusted                                                ; };
+zone-statistics no                                                         ;
+
+rate-limit {
+responses-per-second 10  ;
+window 5                 ;
+exempt-clients { trusted ; };  // Exempter les clients de confiance
+}                        ;
+}                        ;
+
+logging {
+channel graylog_syslog {
+syslog local0                          ;
+severity info                          ;
+print-severity yes                     ;
+print-category yes                     ;
+print-time yes                         ;
+}                                      ;
+channel stderr_log {
+stderr                                 ;
+severity warning                       ;
+print-severity yes                     ;
+print-category yes                     ;
+print-time yes                         ;
+}                                      ;
+category xfer-out { graylog_syslog     ; };
+category xfer-in { graylog_syslog      ; };
+category notify { graylog_syslog       ; };
+category lame-servers { graylog_syslog ; };
+category config { graylog_syslog       ; stderr_log; };
+category default { graylog_syslog      ; stderr_log; };
+category security { graylog_syslog     ; };
+category dnssec { graylog_syslog       ; };
+category queries { graylog_syslog      ; };
+}                                      ;

@@ -1,0 +1,179 @@
+%YAML 1.1
+---
+
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]"
+    EXTERNAL_NET: "!$HOME_NET"
+
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    TELNET_SERVERS: "$HOME_NET"
+    AIM_SERVERS: "$EXTERNAL_NET"
+    DC_SERVERS: "$HOME_NET"
+    DNP3_SERVER: "$HOME_NET"
+    DNP3_CLIENT: "$HOME_NET"
+    MODBUS_CLIENT: "$HOME_NET"
+    MODBUS_SERVER: "$HOME_NET"
+    ENIP_CLIENT: "$HOME_NET"
+    ENIP_SERVER: "$HOME_NET"
+
+
+  port-groups:
+    HTTP_PORTS: "80"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    FTP_PORTS: 21
+    GENEVE_PORTS: 6081
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+
+# Interface à surveiller (adaptez selon vos interfaces)
+af-packet:
+  - interface: eth0  # Votre interface WAN
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    use-mmap: yes
+    tun-mode: tap
+
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+
+# Logging
+host-mode: router
+
+outputs:
+  - fast:
+      enabled: yes
+      filename: /var/log/suricata/fast.log
+      append: yes
+  - eve-log:
+      community-id: true
+      enabled: yes
+      filetype: regular
+      filename: /var/log/suricata/eve.json
+      types:
+        - anomaly:
+          enabled: no
+        - alert:
+            payload: yes
+            payload-buffer-size: 4kb
+            payload-printable: yes
+            packet: yes
+        - http:
+            extended: yes
+        - dns:
+            query: yes
+            answer: yes
+        - tls:
+            extended: yes
+        - files:
+            force-magic: no
+        - drop:
+            alerts: yes
+        - smtp:
+            extended: yes # enable this for extended logging information
+        - flow:
+        - dhcp:
+            enabled: yes
+            # When extended mode is on, all DHCP messages are logged
+            # with full detail. When extended mode is off (the
+            # default), just enough information to map a MAC address
+            # to an IP address is logged.
+            extended: no
+        - ssh
+        - mqtt:
+            # passwords: yes           # enable output of passwords
+        # HTTP2 logging. HTTP2 support is currently experimental and
+        # disabled by default. To enable, uncomment the following line
+        # and be sure to enable http2 in the app-layer section.
+        - http2
+        - stats:
+            totals: yes       # stats for all threads merged together
+            threads: no       # per thread stats
+            deltas: no        # include delta values
+# Performance
+threading:
+  set-cpu-affinity: yes
+  cpu-affinity:
+    - management-cpu-set:
+        cpu: [ 0 ]
+    - receive-cpu-set:
+        cpu: [ "all" ]
+    - worker-cpu-set:
+        cpu: [ "all" ]
+
+# Règles de détection
+detect:
+  profile: medium
+  custom-values:
+    toclient-groups: 3
+    toserver-groups: 25
+
+# Application layer protocols
+app-layer:
+  protocols:
+    http:
+      enabled: yes
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+    dns:
+      tcp:
+        enabled: yes
+      udp:
+        enabled: yes
+    ssh:
+      enabled: yes
+    dnp3:
+      enabled: no
+      detection-enabled: no
+    modbus:
+      enabled: no
+      detection-enabled: no
+    mqtt:
+      enabled: yes
+      # max-msg-length: 1mb
+      # subscribe-topic-match-limit: 100
+      # unsubscribe-topic-match-limit: 100
+      # Maximum number of live MQTT transactions per flow
+      # max-tx: 4096
+    krb5:
+      enabled: yes
+    snmp:
+      enabled: yes
+    ikev2:
+      enabled: yes
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+vlan:
+  use-for-tracking: true
+nfq:
+  mode: accept
+#  repeat-mark: 1
+#  repeat-mask: 1
+#  bypass-mark: 1
+#  bypass-mask: 1
+#  route-queue: 2
+#  batchcount: 20
+  fail-open: yes
+stats:
+  enabled: yes
+  interval: 8
+  logger: file  # ou "syslog" selon votre besoin
+  filename: stats.log  # Chemin vers le fichier de log
+  append: yes  # Pour ajouter les logs au fichier existant
+unix-command:
+  enabled: yes
+  filename: /var/run/suricata/suricata-command.socket

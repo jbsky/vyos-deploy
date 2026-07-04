@@ -1,0 +1,35 @@
+include "/etc/bind/tsig.key";
+
+// Exemple simplifie a 2 vues (interne / publique). Le vrai setup de
+// production peut aller beaucoup plus loin : une vue distincte par
+// sous-reseau permet de servir une reponse differente selon le VLAN
+// d'origine du client (split-horizon tres granulaire) -- duplique le
+// meme bloc "view" ci-dessous par sous-reseau si besoin, en changeant
+// juste le match-clients et le fichier de zone de ton domaine.
+
+view "local" {
+  match-clients { !key tsig-key; trusted; };
+  recursion yes;
+  allow-recursion { trusted; };
+  allow-query { trusted; };
+
+  include "/etc/bind/zones.home.arpa";
+
+  zone "example.com" IN {
+    type master;
+    file "/etc/bind/local_db.example.com";
+  };
+
+  include "/etc/bind/zones.rfc1918";
+  include "/etc/bind/named.conf.default-zones";
+};
+
+view "internet" {
+  match-clients { any; };
+  recursion no;
+  allow-recursion { none; };
+
+  include "/etc/bind/zones.example.com";
+  include "/etc/bind/zones.rfc1918";
+  include "/etc/bind/named.conf.default-zones";
+};

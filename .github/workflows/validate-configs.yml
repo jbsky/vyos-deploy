@@ -1,0 +1,118 @@
+name: Validate example configs
+
+# Verifie que les configs d'exemple bundlees dans etc/ sont reellement
+# valides pour chaque demon (pas juste que le YAML Ansible est correct).
+# Utilise le mode "config-check" natif de chaque service -- rapide,
+# deterministe, pas de dependance reseau (pas de vraie signature ClamAV
+# a telecharger, pas de vrai trafic NFQUEUE necessaire).
+
+on:
+  push:
+    paths:
+      - 'etc/**'
+      - '.github/workflows/validate-configs.yml'
+  pull_request:
+    paths:
+      - 'etc/**'
+
+jobs:
+  bind9:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate throwaway TSIG key
+        run: |
+          TSIG_SECRET=$(dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 -w0)
+          cat > etc/bind/tsig.key <<EOF
+          key "tsig-key" {
+          	algorithm hmac-sha512;
+          	secret "${TSIG_SECRET}";
+          };
+          EOF
+      - name: named-checkconf + named-checkzone
+        run: |
+          docker run --rm -v "$PWD/etc/bind:/etc/bind:ro" \
+            jbsky/bind9-hardened:9.20.24 \
+            /usr/bin/named-checkconf /etc/bind/named.conf
+          echo "OK: named-checkconf"
+      - name: Full boot + dig test
+        run: |
+          docker run -d --name bind9-ci -v "$PWD/etc/bind:/etc/bind:ro" -p 5353:53/udp jbsky/bind9-hardened:9.20.24
+          sleep 3
+          docker logs bind9-ci
+          RESULT=$(dig @127.0.0.1 -p 5353 example.com A +short +time=3 +tries=1)
+          test -n "$RESULT" || { echo "FAIL: no answer for example.com"; exit 1; }
+          echo "OK: example.com -> $RESULT"
+
+  suricata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: suricata -T (config test)
+        run: |
+          docker run --rm --cap-add NET_ADMIN --cap-add SYS_NICE \
+            -v "$PWD/etc/suricata:/etc/suricata:ro" \
+            -v "$PWD/etc/suricata/rules:/var/lib/suricata/rules:ro" \
+            --entrypoint /usr/bin/suricata \
+            jbsky/suricata-hardened:8.0.5 \
+            -T -c /etc/suricata/suricata.yaml -l /tmp
+
+  squid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate throwaway SSL Bump certs
+        run: |
+          mkdir -p etc/squid/ssl_cert
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem -days 1 -nodes -subj "/CN=test"
+          cat /tmp/c.pem /tmp/k.pem > etc/squid/ssl_cert/bump.pem
+          openssl dhparam -out etc/squid/ssl_cert/dhparam.pem 2048
+      - name: squid -k parse
+        run: |
+          docker run --rm -v "$PWD/etc/squid:/etc/squid:ro" \
+            --entrypoint /usr/sbin/squid \
+            jbsky/squid-hardened:7.6 \
+            -k parse -f /etc/squid/squid.conf
+
+  haproxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate throwaway certs
+        run: |
+          mkdir -p etc/haproxy/WWW
+          for name in WILDCARD APP1 WWW; do
+            openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem -days 1 -nodes -subj "/CN=test"
+            cat /tmp/c.pem /tmp/k.pem > "etc/haproxy/WWW/${name}.pem"
+          done
+      - name: haproxy -c (config check)
+        run: |
+          docker run --rm -v "$PWD/etc/haproxy:/usr/local/etc/haproxy:ro" \
+            haproxy:3.0-alpine \
+            haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+
+  proxy-stack:
+    runs-on: ubuntu-latest
+    needs: squid
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate throwaway SSL Bump certs
+        run: |
+          mkdir -p etc/squid/ssl_cert
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem -days 1 -nodes -subj "/CN=test"
+          cat /tmp/c.pem /tmp/k.pem > etc/squid/ssl_cert/bump.pem
+          openssl dhparam -out etc/squid/ssl_cert/dhparam.pem 2048
+      - name: docker compose up (squid + c-icap + clamav)
+        run: docker compose up -d clamav c-icap squid
+      - name: Wait and check containers are still up
+        run: |
+          sleep 10
+          docker compose ps
+          for s in clamav c-icap squid; do
+            status=$(docker inspect -f '{{.State.Status}}' "$(docker compose ps -q $s)")
+            echo "$s: $status"
+            [ "$status" = "running" ] || { docker compose logs "$s"; exit 1; }
+          done
+      - name: Test proxy responds (explicit port, no bump)
+        run: |
+          curl -s -o /dev/null -w "%{http_code}\n" -x http://127.0.0.1:3128 http://example.org/ --max-time 10

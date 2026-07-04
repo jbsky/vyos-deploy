@@ -1,0 +1,16 @@
+zone "home.arpa" IN {
+  type master;
+  notify no;
+  file "/etc/bind/db.home.arpa";
+  allow-query { trusted; };
+  forwarders { };             // Pas de forwarding
+};
+
+# Zone pour gerer home.arpa.home.arpa
+zone "home.arpa.home.arpa" {
+  type master;
+  notify no;
+  file "/etc/bind/db.empty";  // Utilise une zone vide
+  allow-query { trusted; };
+  forwarders { };             // Pas de forwarding
+};

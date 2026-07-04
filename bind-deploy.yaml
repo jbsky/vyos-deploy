@@ -1,0 +1,135 @@
+# ansible-playbook bind-deploy.yaml -i <ton-inventaire>
+#
+# Deploie la configuration BIND9 sur le container VyOS.
+#
+# Les fichiers source sont dans etc/bind/ (versionnes dans git). Ce repo
+# ne fournit pas d'inventaire -- vois le README pour cibler le groupe
+# Ansible "vyos" depuis ton propre inventaire (usage standalone ou en
+# submodule Git).
+#
+# rndc.key/tsig.key ne sont PAS geres par ce playbook (jamais commit,
+# generes localement via tsig-keygen -- exclus explicitement du rsync).
+#
+# Tags disponibles :
+#   config   → copier les fichiers de zone sur VyOS
+#   service  → recharger bind9
+#   check    → verifier la resolution DNS
+#
+# Exemples :
+#   ansible-playbook bind-deploy.yaml
+#   ansible-playbook bind-deploy.yaml --tags config
+#   ansible-playbook bind-deploy.yaml --tags check
+
+- name: Deploy BIND9 config to VyOS container
+  hosts: vyos
+  gather_facts: false
+  vars:
+    bind_dest: /config/containers/bind9
+
+  pre_tasks:
+    # bind_conf n'est PAS mise dans vars: ci-dessus : les vars de play ont une
+    # priorite plus haute que les group_vars/host_vars d'inventaire, ce qui
+    # empecherait un inventaire de fournir sa propre valeur. Le default()
+    # ci-dessous ne s'applique que si rien (inventaire ni -e) ne le fournit.
+    - name: Resolve config source path (inventory override wins over bundled example)
+      ansible.builtin.set_fact:
+        bind_conf: "{{ bind_conf | default(playbook_dir + '/etc/bind') }}"
+        bind_uid: "{{ bind_uid | default('5300') }}"
+      delegate_to: localhost
+      tags: always
+
+    - name: Validate bind config locally before deploy
+      ansible.builtin.command:
+        cmd: named-checkconf {{ bind_conf }}/named.conf
+      delegate_to: localhost
+      changed_when: false
+      tags: [config, service, check]
+
+    - name: Check source directory exists
+      ansible.builtin.stat:
+        path: "{{ bind_conf }}/named.conf"
+      delegate_to: localhost
+      register: _bind_conf_check
+      tags: [config, service, check]
+
+    - name: Fail if source directory missing
+      ansible.builtin.fail:
+        msg: "{{ bind_conf }}/named.conf not found."
+      when: not _bind_conf_check.stat.exists
+      tags: [config, service, check]
+
+  tasks:
+    # Pas de delegate_to/become explicite : ansible_become: true (host_vars)
+    # s'applique par defaut, la tache tourne normalement sur l'hote cible.
+    - name: Synchronize bind config to VyOS
+      ansible.builtin.command:
+        cmd: >-
+          rsync -az --delete --chmod=D0755,F0644
+          --exclude=tsig.key
+          --exclude=rndc.key
+          -e 'ssh -o StrictHostKeyChecking=no'
+          --rsync-path='sudo rsync'
+          {{ bind_conf }}/
+          {{ ansible_user }}@{{ ansible_host }}:{{ bind_dest }}/
+      delegate_to: localhost
+      become: false
+      register: _rsync_result
+      changed_when: "'Number of regular files transferred: 0' not in _rsync_result.stdout"
+      notify: Restart bind9
+      tags: [config]
+
+    - name: Fix permissions for BIND dynamic updates (nsupdate/TSIG)
+      ansible.builtin.shell: |
+        chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}
+        if [ -f {{ bind_dest }}/tsig.key ]; then
+          chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}/tsig.key
+          chmod 0400 {{ bind_dest }}/tsig.key
+        fi
+      changed_when: true
+      tags: [config]
+
+    - name: Ensure bind cache directory exists with correct ownership
+      ansible.builtin.file:
+        path: /config/containers/bind9-cache
+        state: directory
+        owner: "{{ bind_uid }}"
+        group: "{{ bind_uid }}"
+        mode: "0755"
+      tags: [config]
+
+  handlers:
+    - name: Restart bind9
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container bind9
+      tags: [service]
+
+  post_tasks:
+    # Pas de test dig contre l'IP de bridge podman du container bind9 : cette
+    # IP n'est pas joignable en connexion directe ni depuis le netns par
+    # defaut de VyOS ni depuis le reste du LAN (confirme empiriquement --
+    # "No route to host" dans les deux cas ; Netavark ne fait que du DNAT
+    # entrant sur les ports publies, et bind9 n'a justement aucun port publie
+    # dans config.boot, contrairement a squid). Verification process-level
+    # via show container, comme pour Suricata (meme contrainte).
+    - name: Flush handlers to restart bind9 now
+      ansible.builtin.meta: flush_handlers
+      tags: [check]
+
+    - name: Check bind9 container is running
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show container
+      register: _bind9_status
+      changed_when: false
+      failed_when: false
+      tags: [check]
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ _bind9_status.stdout_lines | select('search', 'bind9') | list }}"
+      tags: [check]
+
+    - name: Fail if bind9 isn't up
+      ansible.builtin.fail:
+        msg: "bind9 container not found running: {{ _bind9_status.stdout }}"
+      when: "'bind9' not in _bind9_status.stdout or 'Up' not in (_bind9_status.stdout_lines | select('search', 'bind9') | first | default(''))"
+      tags: [check]

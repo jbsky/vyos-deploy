@@ -1,0 +1,5 @@
+# Wildcard as default (MUST be first) -- covers all *.example.com subdomains
+/usr/local/etc/haproxy/WWW/WILDCARD.pem [alpn h2,http/1.1]
+# Per-domain certs (specific, override wildcard for individual renewal)
+/usr/local/etc/haproxy/WWW/APP1.pem [] app1.example.com
+/usr/local/etc/haproxy/WWW/WWW.pem [] example.com www.example.com mail.example.com

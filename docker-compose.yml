@@ -1,0 +1,86 @@
+# Usage local pour explorer/tester les configs d'exemple de ce repo, EN
+# DEHORS de VyOS (pas de NFQUEUE reel, pas de mode inline IPS -- juste
+# valider que chaque service demarre avec sa config generique et repond).
+#
+# 1. ./test/generate-test-certs.sh   (certs/cles jetables, jamais committes)
+# 2. docker compose up -d
+# 3. dig @127.0.0.1 -p 5353 example.com
+#    curl -x http://127.0.0.1:3128 http://example.org
+#    curl -k https://127.0.0.1:8443 --resolve example.com:8443:127.0.0.1
+#
+# ClamAV tentera de telecharger de vraies signatures virales au demarrage
+# (freshclam) -- normal que ca echoue sans acces internet direct (le
+# HTTPProxyServer de l'exemple pointe vers le squid de ce compose, qui
+# n'a pas d'acces internet sortant particulier dans ce contexte de test).
+# Ce n'est pas bloquant pour valider que les CONFIGS sont correctes.
+
+networks:
+  vyos-example:
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+
+services:
+  bind9:
+    image: docker.io/jbsky/bind9-hardened:9.20.24
+    volumes:
+      - ./etc/bind:/etc/bind:ro
+    ports:
+      - "5353:53/udp"
+      - "5353:53/tcp"
+    networks:
+      - vyos-example
+
+  clamav:
+    image: docker.io/jbsky/clamav-hardened:1.4.4
+    volumes:
+      - ./etc/clamav:/etc/clamav:ro
+    networks:
+      vyos-example:
+        ipv4_address: 172.20.1.20
+
+  c-icap:
+    image: docker.io/jbsky/c-icap-hardened:0.6.5
+    volumes:
+      - ./etc/c-icap:/etc/c-icap:ro
+    depends_on:
+      - clamav
+    networks:
+      vyos-example:
+        ipv4_address: 172.20.1.30
+
+  squid:
+    image: docker.io/jbsky/squid-hardened:7.6
+    volumes:
+      - ./etc/squid:/etc/squid:ro
+    depends_on:
+      - c-icap
+    ports:
+      - "3128:3128"
+      - "3130:3130"
+    networks:
+      vyos-example:
+        ipv4_address: 172.20.1.10
+
+  suricata:
+    image: docker.io/jbsky/suricata-hardened:8.0.5
+    volumes:
+      - ./etc/suricata:/etc/suricata:ro
+      - ./etc/suricata/rules:/var/lib/suricata/rules:ro
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    # Pas de --network host ici (sandbox de test) : NFQUEUE ne recevra pas
+    # de vrai trafic, mais ca suffit pour valider que le process demarre.
+    networks:
+      - vyos-example
+
+  haproxy:
+    image: docker.io/library/haproxy:3.0-alpine
+    volumes:
+      - ./etc/haproxy:/usr/local/etc/haproxy:ro
+    ports:
+      - "8080:80"
+      - "8443:443"
+    networks:
+      - vyos-example

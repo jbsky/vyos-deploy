@@ -1,0 +1,8 @@
+# Au cas ou tu crees un inventaire local pour un usage standalone --
+# ce repo n'en fournit pas, garde le tien hors du controle de version ici.
+inventor*/
+*.retry
+*.pem
+*.key
+vault_pass*
+.vault_pass

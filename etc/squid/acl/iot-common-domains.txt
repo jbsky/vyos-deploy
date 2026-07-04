@@ -1,0 +1,3 @@
+# Exemple -- domaines communs autorises pour tous les devices IoT
+.ntp.org
+.example-update-server.com

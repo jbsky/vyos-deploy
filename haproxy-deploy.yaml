@@ -1,0 +1,114 @@
+# ansible-playbook haproxy-deploy.yaml -i <ton-inventaire>
+#
+# Deploie la configuration HAProxy sur le container Podman de VyOS.
+#
+# Les fichiers source sont dans etc/haproxy/ (versionnes dans git). Ce
+# repo ne fournit pas d'inventaire -- vois le README pour cibler le
+# groupe Ansible "vyos" depuis ton propre inventaire (usage standalone
+# ou en submodule Git).
+#
+# Les certificats Let's Encrypt (WWW/*.pem) sont geres separement (role
+# certbot ou equivalent) et ne sont PAS deployes par ce playbook.
+#
+# Tags disponibles :
+#   config   → copier haproxy.cfg + WWW.crt_list sur VyOS
+#   service  → redemarrer le container haproxy
+#   check    → verifier que HAProxy repond
+#
+# Exemples :
+#   ansible-playbook haproxy-deploy.yaml
+#   ansible-playbook haproxy-deploy.yaml --tags config
+#   ansible-playbook haproxy-deploy.yaml --tags check
+
+- name: Deploy HAProxy config to VyOS container
+  hosts: vyos
+  gather_facts: false
+  vars:
+    haproxy_dest: /config/containers/haproxy
+
+  pre_tasks:
+    # haproxy_conf n'est PAS mise dans vars: ci-dessus : les vars de play ont
+    # une priorite plus haute que les group_vars/host_vars d'inventaire, ce
+    # qui empecherait un inventaire de fournir sa propre valeur. Le default()
+    # ci-dessous ne s'applique que si rien (inventaire ni -e) ne le fournit.
+    - name: Resolve config source path (inventory override wins over bundled example)
+      ansible.builtin.set_fact:
+        haproxy_conf: "{{ haproxy_conf | default(playbook_dir + '/etc/haproxy') }}"
+      delegate_to: localhost
+      tags: always
+
+    - name: Check source directory exists
+      ansible.builtin.stat:
+        path: "{{ haproxy_conf }}/haproxy.cfg"
+      delegate_to: localhost
+      register: _haproxy_conf_check
+      tags: [config, service, check]
+
+    - name: Fail if source directory missing
+      ansible.builtin.fail:
+        msg: "{{ haproxy_conf }}/haproxy.cfg not found."
+      when: not _haproxy_conf_check.stat.exists
+      tags: [config, service, check]
+
+  tasks:
+    # Pas de delegate_to/become explicite : ansible_become: true (host_vars)
+    # s'applique par defaut, owner/group/mode directement sur copy donnent
+    # aussi un vrai support --check/--diff.
+    - name: Deploy haproxy.cfg
+      ansible.builtin.copy:
+        src: "{{ haproxy_conf }}/haproxy.cfg"
+        dest: "{{ haproxy_dest }}/haproxy.cfg"
+      notify: Restart haproxy
+      tags: [config]
+
+    - name: Deploy WWW.crt_list
+      ansible.builtin.copy:
+        src: "{{ haproxy_conf }}/WWW.crt_list"
+        dest: "{{ haproxy_dest }}/WWW.crt_list"
+      notify: Restart haproxy
+      tags: [config]
+
+    - name: Reminder — generate and sync certs for new domains
+      ansible.builtin.debug:
+        msg: >-
+          Config HAProxy deployee. Si c'est un nouveau domaine, genere le
+          cert (Let's Encrypt DNS-01 par exemple) puis synchronise le PEM
+          dans le dossier WWW/ avant de recharger.
+      tags: [config]
+
+  handlers:
+    - name: Restart haproxy
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container haproxy
+      listen: Restart haproxy
+      tags: [service]
+
+  post_tasks:
+    # Pas de wait_for/test contre l'IP de bridge podman du container haproxy :
+    # cette IP n'est pas joignable en connexion directe depuis le netns par
+    # defaut de VyOS ni depuis le reste du LAN (confirme empiriquement --
+    # "No route to host" dans les deux cas ; Netavark ne fait que du DNAT
+    # entrant sur les ports publies). Le test ci-dessous interroge le port
+    # 443 PUBLIE sur l'hote (ansible_host), le vrai chemin qu'emprunte un
+    # client reel.
+    - name: Flush handlers to restart haproxy now
+      ansible.builtin.meta: flush_handlers
+      tags: [check]
+
+    - name: Test HTTPS connectivity
+      ansible.builtin.command:
+        cmd: >-
+          curl -sk -o /dev/null -w '%{http_code}'
+          --resolve {{ haproxy_check_domain | default('example.com') }}:443:{{ ansible_host }}
+          --connect-timeout 10
+          https://{{ haproxy_check_domain | default('example.com') }}
+      delegate_to: localhost
+      register: _haproxy_test
+      changed_when: false
+      failed_when: _haproxy_test.stdout not in ['200', '301', '302', '401', '403']
+      tags: [check]
+
+    - name: Display results
+      ansible.builtin.debug:
+        msg: "HAProxy HTTPS test ({{ haproxy_check_domain | default('example.com') }}) → {{ _haproxy_test.stdout }}"
+      tags: [check]

@@ -1,0 +1,238 @@
+# ansible-playbook proxy-deploy.yaml -i <ton-inventaire>
+#
+# Déploie la configuration de la stack proxy (Squid + c-icap + ClamAV)
+# sur les containers Podman de VyOS.
+#
+# Les fichiers source sont dans etc/{squid,c-icap,clamav}/ (versionnés dans
+# git). Ce repo ne fournit pas d'inventaire -- vois le README pour cibler
+# le groupe Ansible "vyos" depuis ton propre inventaire (usage standalone
+# ou en submodule Git).
+# Les certs Squid SSL-bump (bump.pem, dhparam.pem) sont dans le vault VyOS.
+# Les fichiers non gérés (base virale ClamAV, mime.conf, c-icap.magic) ne
+# sont PAS touchés.
+#
+# Containers et IPs (réseau podman 172.20.1.0/24, exemple) :
+#   squid   → 172.20.1.10  (ports 3128/3130)
+#   c-icap  → 172.20.1.30  (port 1344)
+#   clamav  → 172.20.1.20  (port 3310)
+#
+# Tags disponibles :
+#   config        → copier les fichiers de conf sur VyOS
+#   certs         → déployer les certificats SSL (bump CA + DH params)
+#   service       → redémarrer les containers (clamav → c-icap → squid)
+#   check         → vérifier que le proxy fonctionne
+#   squid_config  → copier uniquement la conf Squid
+#   squid_certs   → déployer uniquement les certs Squid SSL-bump
+#   icap_config   → copier uniquement la conf c-icap + squidclamav
+#   clamav_config → copier uniquement la conf ClamAV
+#
+# Exemples :
+#   ansible-playbook proxy-deploy.yaml
+#   ansible-playbook proxy-deploy.yaml --tags config
+#   ansible-playbook proxy-deploy.yaml --tags squid_config
+#   ansible-playbook proxy-deploy.yaml --tags check
+#   ansible-playbook proxy-deploy.yaml --tags service
+
+- name: Deploy proxy stack config to VyOS containers
+  hosts: vyos
+  gather_facts: false
+  vars:
+    vyos_base: /config/containers
+    # UIDs matching container users
+    squid_uid: "3128"
+    icap_uid: "4100"
+    clamav_uid: "4000"
+
+  pre_tasks:
+    # squid_conf/cicap_conf/clam_conf ne sont PAS mises dans vars: ci-dessus :
+    # les vars de play ont une priorite plus haute que les group_vars/host_vars
+    # d'inventaire, ce qui empecherait un inventaire de fournir sa propre
+    # valeur. Le default() ci-dessous ne s'applique que si rien (inventaire
+    # ni -e) ne le fournit.
+    - name: Resolve config source paths (inventory override wins over bundled example)
+      ansible.builtin.set_fact:
+        squid_conf: "{{ squid_conf | default(playbook_dir + '/etc/squid') }}"
+        cicap_conf: "{{ cicap_conf | default(playbook_dir + '/etc/c-icap') }}"
+        clam_conf: "{{ clam_conf | default(playbook_dir + '/etc/clamav') }}"
+      delegate_to: localhost
+      tags: always
+
+    - name: Check source directories exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ squid_conf }}/squid.conf"
+        - "{{ cicap_conf }}/c-icap.conf"
+        - "{{ clam_conf }}/clamd.conf"
+      delegate_to: localhost
+      register: _conf_check
+      tags: [proxy_deploy, config, certs, squid_config, squid_certs, icap_config, clamav_config, service, check]
+
+    - name: Fail if a source directory is missing
+      ansible.builtin.fail:
+        msg: "{{ item.item }} not found."
+      loop: "{{ _conf_check.results }}"
+      when: not item.stat.exists
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [proxy_deploy, config, certs, squid_config, squid_certs, icap_config, clamav_config, service, check]
+
+  tasks:
+    # ── Squid SSL certs (from vault) ─────────────────────────
+    # Pas de delegate_to/become explicite : ansible_become: true (host_vars)
+    # s'applique par defaut a toutes les taches ci-dessous, qui tournent
+    # normalement sur l'hote cible via la connexion Ansible (sudo distant).
+    - name: Ensure squid ssl_cert directory exists
+      ansible.builtin.file:
+        path: "{{ vyos_base }}/squid/conf/ssl_cert"
+        state: directory
+        mode: "0755"
+      tags: [certs, squid_certs]
+
+    - name: Deploy squid bump CA (from vault)
+      ansible.builtin.copy:
+        content: "{{ vault_squid_bump_pem }}"
+        dest: "{{ vyos_base }}/squid/conf/ssl_cert/bump.pem"
+        mode: "0644"
+      notify: Restart squid
+      tags: [certs, squid_certs]
+
+    - name: Deploy squid DH parameters (from vault)
+      ansible.builtin.copy:
+        content: "{{ vault_squid_dhparam_pem }}"
+        dest: "{{ vyos_base }}/squid/conf/ssl_cert/dhparam.pem"
+        mode: "0644"
+      notify: Restart squid
+      tags: [certs, squid_certs]
+
+    # ── Squid ──────────────────────────────────────────────────
+    # Copie recursive de tout le dossier plutot qu'une tache par fichier :
+    # peu importe les noms exacts (l'exemple generique et une vraie conf
+    # perso n'ont pas forcement les memes fichiers ACL), owner/group
+    # s'appliquent a tout l'arbre, et --check/--diff fonctionnent quand
+    # meme nativement. Destination sous squid/conf/ : c'est ce dossier
+    # qui est monte en volume sur /etc/squid dans le container (voir
+    # config.boot VyOS). squid.conf reference aussi mime.conf et
+    # conf.d/*.conf (fatal si aucun .conf n'existe, d'ou le placeholder
+    # empty.conf) et acl/*.txt -- tout part avec cette meme copie.
+    - name: Deploy squid config directory
+      ansible.builtin.copy:
+        src: "{{ squid_conf }}/"
+        dest: "{{ vyos_base }}/squid/conf/"
+        owner: root
+        group: "{{ squid_uid }}"
+      notify: Restart squid
+      tags: [config, squid_config]
+
+    # ── c-icap ─────────────────────────────────────────────────
+    # Destination sous c-icap/ (volume unique, monte sur /etc/c-icap).
+    # Meme logique : copie recursive (inclut c-icap.magic).
+    - name: Deploy c-icap config directory
+      ansible.builtin.copy:
+        src: "{{ cicap_conf }}/"
+        dest: "{{ vyos_base }}/c-icap/"
+        owner: "{{ icap_uid }}"
+        group: "{{ icap_uid }}"
+        mode: "0640"
+      notify: Restart c-icap
+      tags: [config, icap_config]
+
+    # ── ClamAV ─────────────────────────────────────────────────
+    # Volumes VyOS clamav/conf + clamav/db (config.boot) -- la base virale
+    # (clamav/db) est geree par freshclam a l'interieur du container, ce
+    # playbook ne touche qu'a clamav/conf.
+    - name: Deploy clamd.conf
+      ansible.builtin.copy:
+        src: "{{ clam_conf }}/clamd.conf"
+        dest: "{{ vyos_base }}/clamav/conf/clamd.conf"
+        owner: "{{ clamav_uid }}"
+        group: "{{ clamav_uid }}"
+        mode: "0640"
+      notify: Restart clamav
+      tags: [config, clamav_config]
+
+    - name: Deploy freshclam.conf
+      ansible.builtin.copy:
+        src: "{{ clam_conf }}/freshclam.conf"
+        dest: "{{ vyos_base }}/clamav/conf/freshclam.conf"
+        owner: "{{ clamav_uid }}"
+        group: "{{ clamav_uid }}"
+        mode: "0640"
+      notify: Restart clamav
+      tags: [config, clamav_config]
+
+  # Restart order: clamav → c-icap → squid (dependency chain). Pas de
+  # wait_for entre les restarts : les IPs de bridge podman (172.20.0.0/24)
+  # ne sont pas joignables en connexion directe depuis le netns par defaut
+  # de VyOS (confirme empiriquement -- Netavark ne fait que du DNAT entrant
+  # sur les ports publies, rien ne route l'hote vers une IP de bridge), donc
+  # un wait_for vers ces IPs ne peut structurellement jamais reussir, meme
+  # quand le container est sain. Squid degrade gracieusement de toute facon
+  # (icap_service ... bypass=1 dans squid.conf) si c-icap/clamav mettent du
+  # temps a redemarrer -- le tag "check" en fin de run verifie le resultat
+  # reel (connectivite HTTP/HTTPS) plutot que de deviner un delai.
+  handlers:
+    - name: Restart clamav
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container clamav
+      listen: Restart clamav
+      tags: [service]
+
+    - name: Restart c-icap
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container c-icap
+      listen: Restart c-icap
+      tags: [service]
+
+    - name: Restart squid
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container squid
+      listen: Restart squid
+      tags: [service]
+
+    - name: Wait for squid to be ready
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 3128
+        timeout: 60
+      delegate_to: localhost
+      listen: Restart squid
+      tags: [service]
+
+  post_tasks:
+    - name: Flush handlers to restart containers now
+      ansible.builtin.meta: flush_handlers
+      tags: [check]
+
+    - name: Test proxy connectivity (HTTP)
+      ansible.builtin.command:
+        cmd: >-
+          curl -s -o /dev/null -w '%{http_code}'
+          --proxy http://{{ ansible_host }}:3128
+          --connect-timeout 10
+          http://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz
+      delegate_to: localhost
+      register: _proxy_http_test
+      changed_when: false
+      failed_when: _proxy_http_test.stdout != '200'
+      tags: [check]
+
+    - name: Test proxy connectivity (HTTPS via CONNECT)
+      ansible.builtin.command:
+        cmd: >-
+          curl -s -o /dev/null -w '%{http_code}'
+          --proxy http://{{ ansible_host }}:3128
+          --connect-timeout 10
+          https://registry.npmjs.org/
+      delegate_to: localhost
+      register: _proxy_https_test
+      changed_when: false
+      failed_when: _proxy_https_test.stdout != '200'
+      tags: [check]
+
+    - name: Display results
+      ansible.builtin.debug:
+        msg:
+          - "HTTP  proxy test → {{ _proxy_http_test.stdout }}"
+          - "HTTPS proxy test → {{ _proxy_https_test.stdout }}"
+      tags: [check]
