@@ -10,10 +10,20 @@
 # rndc.key/tsig.key ne sont PAS geres par ce playbook (jamais commit,
 # generes localement via tsig-keygen -- exclus explicitement du rsync).
 #
+# Ce playbook ne valide PAS la config localement, et c'est voulu : named.conf
+# inclut ses fichiers annexes par chemin ABSOLU (include
+# "/etc/bind/named.conf.options"), comme une fois deploye dans le container.
+# Un named-checkconf nu sur la machine de controle resoudrait ces includes
+# contre son propre /etc/bind (silencieusement faux, ou en erreur si absent).
+# La validation (named-checkconf -z, boot reel de named + dig de controle)
+# vit donc dans la CI, via Docker -- voir
+# .github/workflows/validate-configs.yml, implementation de reference
+# reutilisable dans n'importe quelle CI.
+#
 # Tags disponibles :
 #   config   → copier les fichiers de zone sur VyOS
 #   service  → recharger bind9
-#   check    → verifier la resolution DNS
+#   check    → verifier l'etat du container (post-deploiement, sur VyOS)
 #
 # Exemples :
 #   ansible-playbook bind-deploy.yaml
@@ -35,15 +45,9 @@
       ansible.builtin.set_fact:
         bind_conf: "{{ bind_conf | default(playbook_dir + '/etc/bind') }}"
         bind_uid: "{{ bind_uid | default('5300') }}"
+        bind_dynamic_zone_files: "{{ bind_dynamic_zone_files | default([]) }}"
       delegate_to: localhost
       tags: always
-
-    - name: Validate bind config locally before deploy
-      ansible.builtin.command:
-        cmd: named-checkconf {{ bind_conf }}/named.conf
-      delegate_to: localhost
-      changed_when: false
-      tags: [config, service, check]
 
     - name: Check source directory exists
       ansible.builtin.stat:
@@ -58,44 +62,107 @@
       when: not _bind_conf_check.stat.exists
       tags: [config, service, check]
 
+    # Previsualisation du diff avant application reelle. rsync --delete est
+    # garde pour l'application (voir plus bas) car ansible.builtin.copy en
+    # copie recursive ne supprime jamais les fichiers en trop cote distant --
+    # mais un command shelle sort par defaut sous --check et ne montre aucun
+    # contenu. On force donc l'execution (check_mode: false) d'un rsync PULL
+    # en lecture seule vers un repertoire temporaire local, puis un diff -ruN
+    # contre bind_conf, pour obtenir le meme niveau d'info que le --diff
+    # natif de copy sur les 3 autres playbooks.
+    - name: Create temporary local directory for remote config snapshot
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: bind_remote_snapshot_
+      delegate_to: localhost
+      check_mode: false
+      register: _bind_remote_snapshot
+      tags: [config]
+
+    - name: Fetch current remote bind config for diff comparison
+      ansible.builtin.command:
+        cmd: >-
+          rsync -az
+          --exclude=tsig.key
+          --exclude=rndc.key
+          --exclude=*.jnl
+          -e 'ssh -o StrictHostKeyChecking=no'
+          --rsync-path='sudo rsync'
+          {{ ansible_user }}@{{ ansible_host }}:{{ bind_dest }}/
+          {{ _bind_remote_snapshot.path }}/
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      tags: [config]
+
+    - name: Show diff between local config and current remote state
+      ansible.builtin.command:
+        cmd: diff -ruN {{ _bind_remote_snapshot.path }} {{ bind_conf }}
+      delegate_to: localhost
+      check_mode: false
+      register: _bind_diff
+      changed_when: false
+      failed_when: _bind_diff.rc > 1
+      tags: [config]
+
+    - name: Display config diff
+      ansible.builtin.debug:
+        msg: "{{ _bind_diff.stdout_lines | default(['(aucune difference)']) }}"
+      tags: [config]
+
   tasks:
     # Pas de delegate_to/become explicite : ansible_become: true (host_vars)
     # s'applique par defaut, la tache tourne normalement sur l'hote cible.
-    - name: Synchronize bind config to VyOS
-      ansible.builtin.command:
-        cmd: >-
-          rsync -az --delete --chmod=D0755,F0644
-          --exclude=tsig.key
-          --exclude=rndc.key
-          -e 'ssh -o StrictHostKeyChecking=no'
-          --rsync-path='sudo rsync'
-          {{ bind_conf }}/
-          {{ ansible_user }}@{{ ansible_host }}:{{ bind_dest }}/
-      delegate_to: localhost
-      become: false
-      register: _rsync_result
-      changed_when: "'Number of regular files transferred: 0' not in _rsync_result.stdout"
-      notify: Restart bind9
-      tags: [config]
+    - name: Deploy and restart bind9
+      block:
+        - name: Synchronize bind config to VyOS
+          ansible.builtin.command:
+            cmd: >-
+              rsync -az --delete --chmod=D0755,F0644
+              --exclude=tsig.key
+              --exclude=rndc.key
+              -e 'ssh -o StrictHostKeyChecking=no'
+              --rsync-path='sudo rsync'
+              {{ bind_conf }}/
+              {{ ansible_user }}@{{ ansible_host }}:{{ bind_dest }}/
+          delegate_to: localhost
+          become: false
+          register: _rsync_result
+          changed_when: "'Number of regular files transferred: 0' not in _rsync_result.stdout"
+          notify: Restart bind9
+          tags: [config]
 
-    - name: Fix permissions for BIND dynamic updates (nsupdate/TSIG)
-      ansible.builtin.shell: |
-        chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}
-        if [ -f {{ bind_dest }}/tsig.key ]; then
-          chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}/tsig.key
-          chmod 0400 {{ bind_dest }}/tsig.key
-        fi
-      changed_when: true
-      tags: [config]
+        - name: Fix permissions for BIND dynamic updates (nsupdate/TSIG)
+          ansible.builtin.shell: |
+            chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}
+            if [ -f {{ bind_dest }}/tsig.key ]; then
+              chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}/tsig.key
+              chmod 0400 {{ bind_dest }}/tsig.key
+            fi
+            {% for zone_file in bind_dynamic_zone_files %}
+            chown {{ bind_uid }}:{{ bind_uid }} {{ bind_dest }}/{{ zone_file }}
+            {% endfor %}
+          changed_when: true
+          tags: [config]
 
-    - name: Ensure bind cache directory exists with correct ownership
-      ansible.builtin.file:
-        path: /config/containers/bind9-cache
-        state: directory
-        owner: "{{ bind_uid }}"
-        group: "{{ bind_uid }}"
-        mode: "0755"
-      tags: [config]
+        - name: Ensure bind cache directory exists with correct ownership
+          ansible.builtin.file:
+            path: "{{ bind_dest }}-cache"
+            state: directory
+            owner: "{{ bind_uid }}"
+            group: "{{ bind_uid }}"
+            mode: "0755"
+          tags: [config]
+      always:
+        - name: Clean up local remote-state snapshot
+          ansible.builtin.file:
+            path: "{{ _bind_remote_snapshot.path }}"
+            state: absent
+          delegate_to: localhost
+          check_mode: false
+          tags: [config]
 
   handlers:
     - name: Restart bind9

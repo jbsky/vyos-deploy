@@ -14,6 +14,7 @@ on:
   pull_request:
     paths:
       - 'etc/**'
+  workflow_dispatch:
 
 jobs:
   bind9:
@@ -29,12 +30,13 @@ jobs:
           	secret "${TSIG_SECRET}";
           };
           EOF
-      - name: named-checkconf + named-checkzone
+      - name: named-checkconf -z (syntaxe + toutes les zones)
         run: |
           docker run --rm -v "$PWD/etc/bind:/etc/bind:ro" \
+            --entrypoint /usr/bin/named-checkconf \
             jbsky/bind9-hardened:9.20.24 \
-            /usr/bin/named-checkconf /etc/bind/named.conf
-          echo "OK: named-checkconf"
+            -z /etc/bind/named.conf
+          echo "OK: named-checkconf -z"
       - name: Full boot + dig test
         run: |
           docker run -d --name bind9-ci -v "$PWD/etc/bind:/etc/bind:ro" -p 5353:53/udp jbsky/bind9-hardened:9.20.24

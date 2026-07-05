@@ -58,12 +58,25 @@ ou en ligne de commande : `-e squid_conf=... --tags config`.
 
 ## Tester avant d'appliquer
 
-Les tâches de déploiement utilisent `ansible.builtin.copy`, qui supporte
-nativement `--check`/`--diff` — toujours utile avant d'appliquer pour de
-vrai :
+Les tâches de déploiement de proxy/suricata/haproxy utilisent
+`ansible.builtin.copy`, qui supporte nativement `--check`/`--diff` — toujours
+utile avant d'appliquer pour de vrai :
 
 ```bash
 ansible-playbook proxy-deploy.yaml --check --diff --tags config
+```
+
+`bind-deploy.yaml` fait exception : la synchronisation utilise `rsync
+--delete` (pas `copy`) car il faut que la suppression d'un fichier de zone
+côté source se propage réellement sur VyOS — `copy` en copie récursive de
+dossier ne supprime jamais les fichiers en trop côté distant. Le diff n'est
+donc pas celui, natif, de `--diff`, mais un diff de contenu équivalent
+(`diff -ruN`) affiché systématiquement avant l'application, y compris sous
+`--check` :
+
+```bash
+ansible-playbook bind-deploy.yaml --check --tags config   # diff affiche, rien n'est applique
+ansible-playbook bind-deploy.yaml --tags config            # meme diff, puis application reelle (avec --delete)
 ```
 
 ## Tester les configs elles-mêmes (docker compose)
@@ -201,8 +214,8 @@ les tiennes.
 ## bind-deploy.yaml — BIND9 (DNS split-horizon)
 
 Déploie la config BIND9 (`named.conf*`, zones) vers
-`/config/containers/bind9/`, valide la syntaxe localement
-(`named-checkconf`) avant tout transfert, redémarre le container.
+`/config/containers/bind9/`, affiche le diff contre l'état distant courant,
+redémarre le container.
 
 L'exemple bundlé (`etc/bind/`) montre un pattern **split-horizon
 simplifié à 2 vues** (`local` pour le LAN interne, `internet` pour les
@@ -230,6 +243,18 @@ ansible-playbook bind-deploy.yaml --tags check       # verifier
 ```
 
 Tags : `config`, `service`, `check`.
+
+**Validation de la config : volontairement hors du playbook.** `named.conf`
+inclut ses fichiers annexes par chemin absolu (`/etc/bind/...`), donc un
+`named-checkconf` local les résoudrait contre le `/etc/bind` de ta machine
+de contrôle — silencieusement faux. La validation vit dans la CI, via
+Docker : `named-checkconf -z` (toutes les zones, forward+reverse, sans les
+énumérer) puis un vrai boot de `named` avec des `dig` de contrôle — voir
+`.github/workflows/validate-configs.yml`, réutilisable tel quel dans
+n'importe quelle CI. Si ta config a des vues split-horizon filtrées par IP
+client, lance le container en `--network host` : le NAT d'un bridge Docker
+changerait l'IP source vue par `named` et ferait tomber les requêtes dans
+la mauvaise vue.
 
 **Gotcha réseau** : pas de test DNS contre l'IP de bridge podman du
 container — elle n'est joignable ni depuis VyOS lui-même ni depuis le
