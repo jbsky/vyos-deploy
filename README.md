@@ -263,11 +263,22 @@ contrôleur.** `named.conf` inclut ses fichiers annexes par chemin absolu
   servir l'ancienne config en mémoire, le DNS reste up.
 
 **Gotcha réseau** : pas de test DNS contre l'IP de bridge podman du
-container — elle n'est joignable ni depuis VyOS lui-même ni depuis le
-reste du LAN (`No route to host`, confirmé empiriquement ; BIND9 n'a
-d'ailleurs aucun port publié dans `config.boot`, contrairement à Squid ou
-HAProxy). Le tag `check` vérifie donc l'état du container via
-`show container`, pas une vraie requête DNS.
+container **depuis le LAN** — elle n'y est pas routée (`No route to host` ;
+BIND9 n'a d'ailleurs aucun port publié dans `config.boot`, contrairement à
+Squid ou HAProxy). Le tag `check` vérifie donc l'état du container via
+`show container`. En revanche, **depuis l'hôte VyOS lui-même**, l'IP de
+bridge répond (si ta politique de firewall l'autorise) : définis
+`bind_check_server` (l'IP de bridge) et `bind_check_queries` dans ton
+inventaire pour ajouter de vraies requêtes `dig`, exécutées sur l'hôte
+VyOS, au tag `check` :
+
+```yaml
+# group_vars/vyos.yaml (dans ton projet)
+bind_check_server: 172.20.2.10
+bind_check_queries:
+  - {name: example.com, type: A}
+  - {name: pve.home.arpa, type: A}
+```
 
 ## haproxy-deploy.yaml — HAProxy (reverse-proxy TLS)
 

@@ -46,6 +46,12 @@
         bind_conf: "{{ bind_conf | default(playbook_dir + '/etc/bind') }}"
         bind_uid: "{{ bind_uid | default('5300') }}"
         bind_dynamic_zone_files: "{{ bind_dynamic_zone_files | default([]) }}"
+        # Check optionnel de resolution reelle post-restart (tag check) :
+        # definis bind_check_server (IP de bridge du container, joignable
+        # uniquement DEPUIS l'hote VyOS) et bind_check_queries dans ton
+        # inventaire pour activer de vrais dig en plus du show container.
+        bind_check_server: "{{ bind_check_server | default('') }}"
+        bind_check_queries: "{{ bind_check_queries | default([]) }}"
       delegate_to: localhost
       tags: always
 
@@ -214,4 +220,32 @@
       ansible.builtin.fail:
         msg: "bind9 container not found running: {{ _bind9_status.stdout }}"
       when: "'bind9' not in _bind9_status.stdout or 'Up' not in (_bind9_status.stdout_lines | select('search', 'bind9') | first | default(''))"
+      tags: [check]
+
+    # Resolution reelle optionnelle, pilotee par inventaire. L'IP de bridge
+    # n'est joignable que DEPUIS l'hote VyOS lui-meme (cf. gotcha ci-dessus),
+    # donc ces requetes tournent sur l'hote cible, pas sur la machine de
+    # controle. Inactif tant que bind_check_server n'est pas defini.
+    - name: Wait for bind9 to answer on the bridge IP (from the VyOS host)
+      ansible.builtin.wait_for:
+        host: "{{ bind_check_server }}"
+        port: 53
+        timeout: 10
+      when: bind_check_server | length > 0
+      tags: [check]
+
+    - name: Run real-resolution checks (from the VyOS host)
+      ansible.builtin.command:
+        cmd: dig @{{ bind_check_server }} {{ item.name }} {{ item.type }} +short +time=3 +tries=1
+      loop: "{{ bind_check_queries }}"
+      when: bind_check_server | length > 0
+      register: _bind_check_results
+      changed_when: false
+      failed_when: _bind_check_results.rc != 0 or _bind_check_results.stdout == ""
+      tags: [check]
+
+    - name: Display real-resolution results
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }} {{ item.item.type }} -> {{ item.stdout }}"
+      loop: "{{ _bind_check_results.results | default([]) }}"
       tags: [check]
