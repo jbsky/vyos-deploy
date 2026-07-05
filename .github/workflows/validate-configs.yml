@@ -104,6 +104,12 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem -days 1 -nodes -subj "/CN=test"
           cat /tmp/c.pem /tmp/k.pem > etc/squid/ssl_cert/bump.pem
           openssl dhparam -out etc/squid/ssl_cert/dhparam.pem 2048
+      - name: Point squid DNS at a resolver reachable from CI
+        # L'exemple pointe sur 192.168.1.1 (le routeur de la topologie
+        # d'exemple, cf. README) -- inexistant sur un runner GitHub, tout
+        # DNS de squid timeouterait et le test curl rendrait 000.
+        run: |
+          sed -i 's/^dns_nameservers .*/dns_nameservers 1.1.1.1 8.8.8.8/' etc/squid/squid.conf
       - name: docker compose up (squid + c-icap + clamav)
         run: docker compose up -d clamav c-icap squid
       - name: Wait and check containers are still up
@@ -117,4 +123,11 @@ jobs:
           done
       - name: Test proxy responds (explicit port, no bump)
         run: |
-          curl -s -o /dev/null -w "%{http_code}\n" -x http://127.0.0.1:3128 http://example.org/ --max-time 10
+          for i in 1 2 3; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -x http://127.0.0.1:3128 http://example.org/ --max-time 15 || true)
+            echo "tentative $i: HTTP $CODE"
+            case "$CODE" in 200|301|302) exit 0;; esac
+            sleep 10
+          done
+          docker compose logs squid | tail -30
+          exit 1
