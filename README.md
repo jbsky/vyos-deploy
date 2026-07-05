@@ -244,17 +244,23 @@ ansible-playbook bind-deploy.yaml --tags check       # verifier
 
 Tags : `config`, `service`, `check`.
 
-**Validation de la config : volontairement hors du playbook.** `named.conf`
-inclut ses fichiers annexes par chemin absolu (`/etc/bind/...`), donc un
-`named-checkconf` local les résoudrait contre le `/etc/bind` de ta machine
-de contrôle — silencieusement faux. La validation vit dans la CI, via
-Docker : `named-checkconf -z` (toutes les zones, forward+reverse, sans les
-énumérer) puis un vrai boot de `named` avec des `dig` de contrôle — voir
-`.github/workflows/validate-configs.yml`, réutilisable tel quel dans
-n'importe quelle CI. Si ta config a des vues split-horizon filtrées par IP
-client, lance le container en `--network host` : le NAT d'un bridge Docker
-changerait l'IP source vue par `named` et ferait tomber les requêtes dans
-la mauvaise vue.
+**Validation de la config : en CI + gate sur la cible, pas sur le
+contrôleur.** `named.conf` inclut ses fichiers annexes par chemin absolu
+(`/etc/bind/...`), donc un `named-checkconf` local les résoudrait contre le
+`/etc/bind` de ta machine de contrôle — silencieusement faux. Deux niveaux :
+
+- **En CI, avant de déployer** : `named-checkconf -z` (toutes les zones,
+  forward+reverse, sans les énumérer) puis un vrai boot de `named` avec des
+  `dig` de contrôle — voir `.github/workflows/validate-configs.yml`,
+  réutilisable tel quel dans n'importe quelle CI. Si ta config a des vues
+  split-horizon filtrées par IP client, garde le `dig` en loopback dans le
+  netns où `named` tourne : le NAT d'un bridge Docker changerait l'IP
+  source et ferait tomber les requêtes dans la mauvaise vue.
+- **Sur VyOS, après rsync et avant restart** : le playbook exécute
+  `podman exec bind9 named-checkconf -z` — le binaire du container
+  lui-même, includes résolus dans le vrai contexte. En cas d'échec le play
+  s'arrête avant le handler de restart : le `named` en cours continue de
+  servir l'ancienne config en mémoire, le DNS reste up.
 
 **Gotcha réseau** : pas de test DNS contre l'IP de bridge podman du
 container — elle n'est joignable ni depuis VyOS lui-même ni depuis le

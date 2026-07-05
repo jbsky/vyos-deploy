@@ -147,6 +147,21 @@
           changed_when: true
           tags: [config]
 
+        # Gate avant restart : valide la config DEPLOYEE avec le binaire du
+        # container bind9 lui-meme (les includes en chemins absolus
+        # /etc/bind/... se resolvent dans le bon contexte, version de named
+        # strictement identique a l'execution -- et zero docker/podman sur la
+        # machine de controle). En cas d'echec, le play s'arrete AVANT le
+        # flush du handler Restart bind9 : le named en cours continue de
+        # servir l'ancienne config en memoire, le DNS reste up. Le fichier
+        # sur disque est deja remplace (rsync ci-dessus) -- corriger et
+        # redeployer, ou restaurer, avant tout restart manuel.
+        - name: Validate deployed config with the container's own binary (named-checkconf -z)
+          ansible.builtin.command:
+            cmd: podman exec bind9 /usr/bin/named-checkconf -z /etc/bind/named.conf
+          changed_when: false
+          tags: [config]
+
         - name: Ensure bind cache directory exists with correct ownership
           ansible.builtin.file:
             path: "{{ bind_dest }}-cache"
