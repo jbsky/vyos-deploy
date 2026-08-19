@@ -32,7 +32,7 @@ services:
       - vyos-example
 
   clamav:
-    image: docker.io/jbsky/clamav-hardened:1.4.4
+    image: docker.io/jbsky/clamav-hardened:1.4.6
     volumes:
       - ./etc/clamav:/etc/clamav:ro
     networks:
