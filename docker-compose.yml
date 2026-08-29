@@ -22,7 +22,7 @@ networks:
 
 services:
   bind9:
-    image: docker.io/jbsky/bind9-hardened:9.20.24
+    image: docker.io/jbsky/bind9-hardened:9.20.27
     volumes:
       - ./etc/bind:/etc/bind:ro
     ports:
@@ -32,7 +32,7 @@ services:
       - vyos-example
 
   clamav:
-    image: docker.io/jbsky/clamav-hardened:1.4.6
+    image: docker.io/jbsky/clamav-hardened:1.5.4
     volumes:
       - ./etc/clamav:/etc/clamav:ro
     networks:
@@ -63,7 +63,7 @@ services:
         ipv4_address: 172.20.1.10
 
   suricata:
-    image: docker.io/jbsky/suricata-hardened:8.0.5
+    image: docker.io/jbsky/suricata-hardened:8.0.6
     volumes:
       - ./etc/suricata:/etc/suricata:ro
       - ./etc/suricata/rules:/var/lib/suricata/rules:ro
