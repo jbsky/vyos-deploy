@@ -56,6 +56,33 @@ haproxy_conf: /chemin/vers/ta/vraie/conf/haproxy
 
 ou en ligne de commande : `-e squid_conf=... --tags config`.
 
+## Déclarer les images attendues (optionnel, recommandé)
+
+Le tag d'image d'un conteneur VyOS se pose à la main (`set container name <nom>
+image <ref>`) : rien ne garantit que ce qui tourne corresponde à ce que ces
+playbooks valident. Déclare-les dans ton inventaire et chaque run vérifie
+l'alignement **avant** de déployer quoi que ce soit :
+
+```yaml
+# host_vars/vyos.home.arpa/main.yaml
+vyos_container_images:
+  bind9: docker.io/jbsky/bind9-hardened:9.20.27
+  squid: docker.io/jbsky/squid-hardened:7.6
+  c-icap: docker.io/jbsky/c-icap-hardened:0.6.5
+  clamav: docker.io/jbsky/clamav-hardened:1.5.4
+  suricata: docker.io/jbsky/suricata-hardened:8.0.6
+```
+
+La vérification est en **lecture seule** : elle échoue bruyamment sur une
+dérive, elle ne réécrit jamais la configuration du routeur. Sans la variable,
+elle ne fait rien -- le dépôt reste utilisable tel quel.
+
+Pourquoi ça compte : le 2026-08-29, une `clamd.conf` était validée contre
+ClamAV 1.4 alors que le routeur tournait en 1.5, version qui a rendu
+obligatoire la vérification de signature des bases virales. Le conteneur a
+bouclé 3110 fois, et comme Squid est configuré avec `bypass=1`, le trafic est
+sorti non scanné pendant huit heures sans qu'aucun signe n'apparaisse.
+
 ## Tester avant d'appliquer
 
 Les tâches de déploiement de proxy/suricata/haproxy utilisent

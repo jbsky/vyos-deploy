@@ -1,0 +1,58 @@
+---
+# Verifie que les images qui tournent sur le routeur correspondent a ce que
+# l'inventaire declare. LECTURE SEULE : ce fichier ne change jamais la
+# configuration du routeur, il echoue bruyamment quand elle a derive.
+#
+# Pourquoi : le tag d'image d'un container VyOS se pose a la main
+# (`set container name <nom> image <ref>`), donc rien ne garantit que ce qui
+# tourne correspond a ce que ce depot valide. Constate le 2026-08-29 : la CI
+# validait une clamd.conf contre ClamAV 1.4 alors que la production tournait
+# en 1.5, version qui a rendu obligatoire la verification de signature des
+# bases virales -- le container a boucle 3110 fois sans que rien ne le dise.
+#
+# S'active en declarant `vyos_container_images` dans l'inventaire :
+#
+#   vyos_container_images:
+#     clamav: docker.io/jbsky/clamav-hardened:1.5.4.1
+#
+# Sans cette variable, la boucle porte sur une liste vide : aucun effet, le
+# depot reste utilisable tel quel hors de tout inventaire.
+
+- name: Read the container image tags from the running VyOS config
+  ansible.builtin.command:
+    cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+  register: _vyos_running_cfg
+  changed_when: false
+  check_mode: false
+  tags: always
+  when: (vyos_container_images | default({})) | length > 0
+
+- name: Extract the image each managed container actually runs
+  ansible.builtin.set_fact:
+    _running_container_images: >-
+      {{ _running_container_images | default({}) | combine({
+           item: (_vyos_running_cfg.stdout
+                  | regex_findall("set container name " ~ item ~ " image '([^']+)'")
+                  | first | default(''))
+         }) }}
+  loop: "{{ _checked_containers }}"
+  tags: always
+  when: (vyos_container_images | default({})) | length > 0
+
+- name: Fail when the router runs an image the inventory does not declare
+  ansible.builtin.assert:
+    that:
+      - _running_container_images[item] == vyos_container_images[item]
+    fail_msg: >-
+      Derive d'image sur « {{ item }} » : l'inventaire declare
+      {{ vyos_container_images[item] }}, le routeur fait tourner
+      {{ _running_container_images[item] | default('(rien)') or '(aucune image declaree)' }}.
+      Aligner l'un sur l'autre avant de deployer -- la configuration de ce depot
+      est ecrite pour la version declaree.
+    success_msg: "{{ item }} : {{ vyos_container_images[item] }}"
+    quiet: true
+  loop: "{{ _checked_containers }}"
+  tags: always
+  when:
+    - (vyos_container_images | default({})) | length > 0
+    - item in vyos_container_images

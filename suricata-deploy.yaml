@@ -35,6 +35,16 @@
     script_dest: /config/scripts/suricata-update.sh
 
   pre_tasks:
+    # Garde-fou de version : echoue si le routeur fait tourner une image
+    # differente de celle que l'inventaire declare. Lecture seule, sans
+    # effet si `vyos_container_images` n'est pas defini. Voir
+    # tasks/check-container-images.yml pour le pourquoi.
+    - name: Check the running container images against the inventory
+      ansible.builtin.include_tasks: tasks/check-container-images.yml
+      vars:
+        _checked_containers: ["suricata"]
+      tags: always
+
     # suricata_conf n'est PAS mis dans vars: ci-dessus : les vars de play ont
     # une priorite plus haute que les group_vars/host_vars d'inventaire, ce
     # qui empecherait un inventaire de fournir sa propre valeur. Le default()
