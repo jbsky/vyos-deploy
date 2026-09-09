@@ -31,9 +31,17 @@
 #  Les phases
 # ---------------------------------------------------------------------
 #
+#   --tags latest   resout le dernier tag immuable publie, et le compare a
+#                   l'inventaire. Avec -e write_inventory=true, il PORTE
+#                   l'inventaire dessus (rien n'est envoye au routeur).
 #   --tags check    constate la derive, ne touche a rien
 #   --tags pull     telecharge les images seulement
 #   --tags apply    pose les tags, commit, save, verifie, redemarre
+#
+# L'enchainement complet d'une mise a jour :
+#   --tags latest -e write_inventory=true    # porte l'inventaire
+#   git diff && git commit                    # relire, puis figer
+#   --tags apply                              # appliquer au routeur
 #
 #   ansible-playbook image-update.yaml                # tout
 #   ansible-playbook image-update.yaml --tags check   # rapport seul
@@ -178,7 +186,97 @@
         - (_a_retrograder | length) > 0
       vars:
         _a_retrograder: "{{ (_table | default([])) | selectattr('retrograde') | list }}"
-      tags: always
+      # Volontairement PAS `always` : ce garde protege le ROUTEUR, donc il ne
+      # concerne que les phases qui l'atteignent. Le tagger `always` bloquait
+      # `latest` -- c'est-a-dire la phase qui repare precisement la cause de la
+      # retrogradation. Et `check` doit rapporter, pas echouer.
+      tags: [pull, apply]
+
+    # --- latest --------------------------------------------------------
+    # Resout le dernier tag IMMUABLE publie pour chaque service, et porte
+    # l'inventaire dessus. C'est l'etape qui manquait : sans elle, `apply`
+    # aligne le routeur sur un inventaire qui peut etre en retard -- et
+    # retrograde.
+    #
+    # Regle : chaque image publie `latest`, la version amont seule, et la
+    # version amont suffixee d'un compteur de revision. Les deux premieres
+    # sont REECRITES EN PLACE a chaque rebuild. Un tag n'est donc epinglable
+    # que s'il existe un autre tag qui en est un prefixe strict -- « 7.7 »
+    # sous « 7.7.7 » prouve que le compteur a bien ete ajoute.
+
+    - name: "latest — interroger le registre"
+      ansible.builtin.uri:
+        url: "https://hub.docker.com/v2/repositories/{{ _depot }}/tags?page_size=100"
+        return_content: true
+      register: _registre
+      loop: "{{ _table | default([]) }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      vars:
+        _depot: >-
+          {{ item.voulue | regex_replace('^docker\.io/', '') | regex_replace(':.*$', '') }}
+      delegate_to: localhost
+      changed_when: false
+      tags: [latest]
+
+    - name: "latest — resoudre le dernier tag immuable"
+      ansible.builtin.set_fact:
+        _dernier: "{{ _dernier | default({}) | combine({ item.item.nom: _choisi }) }}"
+      vars:
+        _noms: "{{ item.json.results | map(attribute='name') | select('match', '^[0-9]+(\\.[0-9]+)+$') | list }}"
+        _immuables: >-
+          {{ _noms | select('match',
+               '^(' ~ (_noms | map('regex_escape') | join('|')) ~ ')\.') | list }}
+        _choisi: >-
+          {{ (_immuables | community.general.version_sort | last)
+             if (_immuables | length) > 0 else '' }}
+      loop: "{{ _registre.results }}"
+      loop_control:
+        label: "{{ item.item.nom }}"
+      tags: [latest]
+
+    - name: "latest — ce que l'inventaire devrait declarer"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.nom }} :
+          {{ 'deja au dernier (' ~ _tag ~ ')'
+             if _tag == (item.voulue.split(':') | last)
+             else (item.voulue.split(':') | last) ~ ' -> ' ~ _tag }}
+      vars:
+        _tag: "{{ _dernier[item.nom] | default('(aucun tag immuable publie)', true) }}"
+      loop: "{{ _table | default([]) }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      tags: [latest]
+
+    # Ecriture sur demande seulement : le changement doit se relire en
+    # `git diff` avant d'atteindre le routeur.
+    - name: "latest — porter l'inventaire au dernier tag"
+      ansible.builtin.lineinfile:
+        path: "{{ _fichier }}"
+        regexp: "^(\\s+){{ item.nom }}:\\s*\\S+\\s*$"
+        line: "\\g<1>{{ item.nom }}: {{ item.voulue | regex_replace(':[^:]+$', '') }}:{{ _dernier[item.nom] }}"
+        backrefs: true
+      vars:
+        _fichier: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/main.yaml"
+      loop: "{{ _table | default([]) }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      when:
+        - write_inventory | default(false) | bool
+        - (_dernier[item.nom] | default('')) | length > 0
+        - _dernier[item.nom] != (item.voulue.split(':') | last)
+      delegate_to: localhost
+      tags: [latest]
+
+    - name: "latest — relire le diff avant de committer"
+      ansible.builtin.debug:
+        msg: >-
+          Inventaire porte au dernier tag. Relisez avant de committer :
+          git diff -- {{ inventory_dir }}/host_vars/{{ inventory_hostname }}/main.yaml
+          puis relancez avec --tags apply.
+      when: write_inventory | default(false) | bool
+      tags: [latest]
 
     # --- check ---------------------------------------------------------
 
