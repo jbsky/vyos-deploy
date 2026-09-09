@@ -1,0 +1,50 @@
+---
+# ansible-playbook image-update.yaml -i <ton-inventaire>
+#
+# Aligne les images des containers VyOS sur ce que declare l'inventaire.
+#
+# C'est le SEUL playbook de ce depot qui modifie la configuration du
+# routeur. Les autres (`<service>-deploy.yaml`) deploient des fichiers de
+# configuration et se contentent de CONSTATER une derive d'image, en
+# lecture seule. La separation est deliberee : deployer une conf ne doit
+# jamais changer une version d'image en passant.
+#
+# Source de verite : `vyos_container_images` dans l'inventaire.
+#
+#   vyos_container_images:
+#     bind9:  docker.io/jbsky/bind9-hardened:9.20.27.9
+#     squid:  docker.io/jbsky/squid-hardened:7.7.4
+#
+# La reference doit etre COMPLETE. `registries.conf` declare un registre de
+# recherche par defaut qui n'est pas Docker Hub : un nom court interroge le
+# mauvais registre et echoue.
+#
+# Deroule : pre-tirage -> une seule transaction set/commit/save ->
+# relecture de la configuration -> redemarrage par systemd.
+#
+# A LANCER PAR LA CHAINE CI, jamais a la main : ce playbook touche le DNS
+# et le proxy, et un routeur casse s'isole de la machine qui voudrait le
+# reparer. Garder la porte manuelle (workflow_dispatch) cote CI.
+#
+# Simulation (ne change rien, dit ce qui changerait) :
+#   ansible-playbook image-update.yaml --check
+#
+# Cibler un seul container :
+#   ansible-playbook image-update.yaml -e '{"vyos_container_images":{"bind9":"docker.io/jbsky/bind9-hardened:9.20.27.9"}}'
+
+- name: Align VyOS container images with the inventory
+  hosts: vyos
+  gather_facts: false
+
+  pre_tasks:
+    - name: Fail early when the inventory declares nothing
+      ansible.builtin.fail:
+        msg: >-
+          `vyos_container_images` est vide ou absent. Ce playbook n'a rien a
+          appliquer -- declarez les images attendues dans l'inventaire.
+      when: (vyos_container_images | default({})) | length == 0
+
+  tasks:
+    - name: Update the container images
+      ansible.builtin.include_tasks: tasks/update-container-images.yml
+      tags: [images]

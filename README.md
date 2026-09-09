@@ -19,6 +19,7 @@ Chaque service a son propre playbook autonome à la racine
 | `suricata-deploy.yaml` | Suricata IPS inline (NFQUEUE) + mise à jour des règles |
 | `bind-deploy.yaml` | BIND9 (zones, split-horizon, TSIG pour ACME DNS-01) |
 | `haproxy-deploy.yaml` | HAProxy (reverse-proxy TLS vers Traefik/K3s) |
+| `image-update.yaml` | Aligne les **images** des conteneurs sur l'inventaire (seul playbook qui modifie `config.boot`) |
 
 ## Ce repo ne fournit aucun inventaire
 
@@ -76,6 +77,42 @@ vyos_container_images:
 La vérification est en **lecture seule** : elle échoue bruyamment sur une
 dérive, elle ne réécrit jamais la configuration du routeur. Sans la variable,
 elle ne fait rien -- le dépôt reste utilisable tel quel.
+
+### Appliquer la dérive plutôt que la constater
+
+`image-update.yaml` fait l'inverse : il pose sur le routeur les tags que
+l'inventaire déclare.
+
+```bash
+ansible-playbook image-update.yaml --check    # dit ce qui changerait
+ansible-playbook image-update.yaml            # applique
+```
+
+Il est **séparé des playbooks de déploiement**, et c'est délibéré : déployer une
+configuration ne doit jamais changer une version d'image en passant. Les
+`<service>-deploy.yaml` continuent d'appeler la vérification seule.
+
+Déroulé : pré-tirage des images -> une seule transaction `set`/`commit`/`save`
+-> relecture de la configuration pour vérifier -> redémarrage par systemd.
+
+Trois raisons à cet ordre :
+
+- **Le pré-tirage d'abord** : sans l'image en local, le `commit` détruit le
+  conteneur existant avant d'échouer à créer le nouveau, et le service reste à
+  terre. Un échec au pré-tirage laisse le routeur intact.
+- **Une seule transaction** : un `commit` par conteneur laisserait un état mixte
+  si le second échouait.
+- **Le redémarrage à la fin** : le `commit` recrée les conteneurs **hors** du
+  chemin systemd. Pour Squid, les règles nft REDIRECT disparaissent alors en
+  silence et tout le VLAN concerné perd HTTPS, sans qu'aucune sonde applicative
+  ne bronche. `restart container` repasse par l'unité systemd.
+
+La référence doit être **complète** (`docker.io/...`) : `registries.conf`
+déclare un registre de recherche par défaut qui n'est pas Docker Hub, et un nom
+court interroge le mauvais registre.
+
+Ce playbook touche le DNS et le proxy : le lancer par la chaîne CI, avec une
+porte manuelle, jamais depuis un poste.
 
 Pourquoi ça compte : le 2026-08-29, une `clamd.conf` était validée contre
 ClamAV 1.4 alors que le routeur tournait en 1.5, version qui a rendu
