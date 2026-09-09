@@ -1,0 +1,125 @@
+---
+# Met UN container a la version que l'inventaire declare pour lui.
+#
+# Appele une fois par service depuis `image-update.yaml`, qui porte les tags
+# Ansible. Travailler container par container est deliberé : bind9 et squid
+# n'ont rien a voir l'un avec l'autre, et une transaction commune les
+# rendrait solidaires sans raison. Ici, un echec sur l'un laisse les autres
+# exactement dans l'etat ou ils etaient.
+#
+# Attend `_cible` : le nom du container (clef de `vyos_container_images`).
+#
+# Ce qu'il faut savoir avant de lire :
+#
+# 1. Le tag vit dans `config.boot`, pas dans un fichier. Il se pose par le
+#    wrapper de CONFIGURATION, distinct du wrapper op-mode utilise ailleurs.
+# 2. `begin`/`set`/`commit`/`save`/`end` tiennent dans UN SEUL appel : chaque
+#    tache ouvre un shell neuf, une session de configuration ne survit pas.
+# 3. `source /etc/default/vyatta` est obligatoire -- avec `;`, pas `&&`.
+#    Sans lui `$vyos_validators_dir` est vide et tout validateur echoue.
+# 4. Le wrapper est SILENCIEUX en cas de succes : on verifie en relisant.
+# 5. L'image doit etre PRE-TIREE, sinon le commit detruit le container
+#    existant avant d'echouer a creer le nouveau.
+
+- name: "{{ _cible }} — read the configured image"
+  ansible.builtin.command:
+    cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+  register: _cfg_avant
+  changed_when: false
+  check_mode: false
+
+- name: "{{ _cible }} — compare with the inventory"
+  ansible.builtin.set_fact:
+    _actuelle: >-
+      {{ _cfg_avant.stdout
+         | regex_findall("set container name " ~ _cible ~ " image '([^']+)'")
+         | first | default('') }}
+    _voulue: "{{ vyos_container_images[_cible] }}"
+  check_mode: false
+
+- name: "{{ _cible }} — already aligned"
+  ansible.builtin.debug:
+    msg: "{{ _cible }} : {{ _voulue }} (rien a faire)"
+  when: _actuelle == _voulue
+
+- name: "{{ _cible }} — plan"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _cible }} : {{ _actuelle | default('(aucune)', true) }} -> {{ _voulue }}
+  when: _actuelle != _voulue
+
+# --- Pre-tirage --------------------------------------------------------
+# Volontairement AVANT toute ecriture : un echec ici laisse le routeur dans
+# l'etat ou on l'a trouve.
+
+- name: "{{ _cible }} — pull the image before touching the configuration"
+  ansible.builtin.command:
+    cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper add container image {{ _voulue }}"
+  register: _pull
+  changed_when: true
+  failed_when: _pull.rc != 0
+  when:
+    - _actuelle != _voulue
+    - not ansible_check_mode
+
+# --- Ecriture ----------------------------------------------------------
+
+- name: "{{ _cible }} — set the tag, commit and save"
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      source /etc/default/vyatta;
+      W=/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper
+      $W begin
+      $W set container name {{ _cible }} image '{{ _voulue }}'
+      $W commit
+      $W save
+      $W end
+    executable: /bin/bash
+  changed_when: true
+  when:
+    - _actuelle != _voulue
+    - not ansible_check_mode
+
+# --- Verification ------------------------------------------------------
+# Le wrapper ne dit rien quand il reussit : la seule preuve est de relire.
+
+- name: "{{ _cible }} — read the configuration back"
+  ansible.builtin.command:
+    cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+  register: _cfg_apres
+  changed_when: false
+  when:
+    - _actuelle != _voulue
+    - not ansible_check_mode
+
+- name: "{{ _cible }} — fail if the configuration does not show the declared image"
+  ansible.builtin.assert:
+    that:
+      - (_cfg_apres.stdout
+         | regex_findall("set container name " ~ _cible ~ " image '([^']+)'")
+         | first | default('')) == _voulue
+    fail_msg: >-
+      « {{ _cible }} » devait passer en {{ _voulue }}, la configuration montre
+      {{ (_cfg_apres.stdout
+          | regex_findall("set container name " ~ _cible ~ " image '([^']+)'")
+          | first | default('(rien)')) }}.
+    success_msg: "{{ _cible }} : {{ _voulue }}"
+    quiet: true
+  when:
+    - _actuelle != _voulue
+    - not ansible_check_mode
+
+# --- Redemarrage -------------------------------------------------------
+# Le commit a recree le container HORS du chemin systemd. Pour squid, cela
+# fait disparaitre les regles nft REDIRECT en silence et tout le VLAN perd
+# HTTPS -- sans qu'aucune sonde applicative ne bronche, le proxy lui-meme
+# allant tres bien. `restart container` repasse par l'unite systemd.
+
+- name: "{{ _cible }} — restart through systemd"
+  ansible.builtin.command:
+    cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper restart container {{ _cible }}"
+  changed_when: true
+  when:
+    - _actuelle != _voulue
+    - not ansible_check_mode
