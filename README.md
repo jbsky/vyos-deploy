@@ -84,9 +84,25 @@ elle ne fait rien -- le dépôt reste utilisable tel quel.
 l'inventaire déclare.
 
 ```bash
-ansible-playbook image-update.yaml --check    # dit ce qui changerait
-ansible-playbook image-update.yaml            # applique
+ansible-playbook image-update.yaml --tags check    # constate, ne touche a rien
+ansible-playbook image-update.yaml --tags pull     # telecharge seulement
+ansible-playbook image-update.yaml                 # tout : check, pull, apply
+ansible-playbook image-update.yaml --check         # simulation Ansible
 ```
+
+Les tags servent **deux choses a la fois**. `check`, `pull` et `apply` choisissent
+la phase ; un **nom de service** ne selectionne aucune tache, il filtre le tableau
+de travail. Les deux se combinent :
+
+```bash
+ansible-playbook image-update.yaml --tags squid,check          # verifier squid seul
+ansible-playbook image-update.yaml --tags bind9,clamav,pull    # telecharger pour ces deux-la
+ansible-playbook image-update.yaml --skip-tags clamav          # tout sauf clamav
+```
+
+Restreindre limite aussi la transaction : un seul service retenu donne un seul
+`commit`. Et un nom de service **sans phase** echoue avec un message explicite
+plutot que de sortir vert sans rien faire.
 
 Il est **séparé des playbooks de déploiement**, et c'est délibéré : déployer une
 configuration ne doit jamais changer une version d'image en passant. Les
