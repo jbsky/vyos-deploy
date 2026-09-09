@@ -1,16 +1,22 @@
 ---
 # ansible-playbook image-update.yaml -i <ton-inventaire>
 #
-# Telecharge l'image declaree par l'inventaire et pose son tag dans la
-# configuration du routeur, service par service.
+# Telecharge les images declarees par l'inventaire et pose leurs tags dans la
+# configuration du routeur.
 #
 # C'est le SEUL playbook de ce depot qui modifie `config.boot`. Les autres
 # (`<service>-deploy.yaml`) deploient des fichiers de configuration et se
-# contentent de CONSTATER une derive d'image, en lecture seule. La
-# separation est deliberee : deployer une conf ne doit jamais changer une
-# version d'image en passant.
+# contentent de CONSTATER une derive d'image, en lecture seule. La separation
+# est deliberee : deployer une conf ne doit jamais changer une version
+# d'image en passant.
 #
-# Source de verite : `vyos_container_images` dans l'inventaire.
+# ---------------------------------------------------------------------
+#  Le tableau
+# ---------------------------------------------------------------------
+#
+# `vyos_container_images` fait office de tableau : aucune liste de services
+# n'est ecrite ici. Ajouter une entree a l'inventaire suffit, le playbook n'a
+# pas a connaitre les services.
 #
 #   vyos_container_images:
 #     bind9: docker.io/jbsky/bind9-hardened:9.20.27.9
@@ -22,21 +28,36 @@
 # version amont seule et `latest` sont reecrites en place a chaque rebuild.
 #
 # ---------------------------------------------------------------------
-#  Tags Ansible : un par service
+#  Les phases
 # ---------------------------------------------------------------------
 #
-#   ansible-playbook image-update.yaml                    # tous les services
-#   ansible-playbook image-update.yaml --tags squid       # squid seul
-#   ansible-playbook image-update.yaml --tags bind9,clamav
-#   ansible-playbook image-update.yaml --check            # ne change rien
+#   --tags check    constate la derive, ne touche a rien
+#   --tags pull     telecharge les images seulement
+#   --tags apply    pose les tags, commit, save, verifie, redemarre
 #
-# Un service absent de `vyos_container_images` est saute sans erreur : le
-# depot reste utilisable avec un inventaire partiel.
+#   ansible-playbook image-update.yaml                # tout
+#   ansible-playbook image-update.yaml --tags check   # rapport seul
+#   ansible-playbook image-update.yaml --tags pull    # pre-charger sans rien changer
+#   ansible-playbook image-update.yaml --check        # simulation Ansible
 #
-# Chaque service est traite de bout en bout et INDEPENDAMMENT : pre-tirage,
-# set/commit/save, relecture, redemarrage. bind9 et squid n'ont rien a voir
-# l'un avec l'autre, une transaction commune les rendrait solidaires sans
-# raison -- un echec sur l'un laisse les autres intacts.
+# `pull` est separable a dessein : on peut pre-charger les images en journee
+# et n'appliquer que dans une fenetre de maintenance. C'est aussi la phase
+# qui echoue si le registre est injoignable ou le tag inexistant -- autant le
+# savoir avant d'avoir touche a la configuration.
+#
+# ---------------------------------------------------------------------
+#  Restreindre a un service
+# ---------------------------------------------------------------------
+#
+#   ansible-playbook image-update.yaml -e image_services=squid
+#   ansible-playbook image-update.yaml -e image_services=bind9,clamav
+#
+# SANS ESPACE apres la virgule : `-e` decoupe ses arguments sur l'espace, et
+# « bind9, clamav » serait lu comme la valeur « bind9, » suivie d'une seconde
+# paire clef=valeur. Verifie -- seul bind9 est alors retenu, en silence.
+#
+# Restreindre limite aussi la transaction : un seul service selectionne donne
+# un seul `commit`.
 #
 # A LANCER PAR LA CHAINE CI, jamais a la main : ce playbook touche le DNS et
 # le proxy, et un routeur casse s'isole de la machine qui voudrait le
@@ -46,7 +67,21 @@
   hosts: vyos
   gather_facts: false
 
-  pre_tasks:
+  vars:
+    # Vide = tous les services declares. Sinon, noms separes par des virgules.
+    image_services: ""
+
+    # Les services retenus : tout l'inventaire, ou la selection demandee.
+    _retenus: >-
+      {{ (image_services | split(',') | map('trim') | select | list)
+         if (image_services | length) > 0
+         else (vyos_container_images | default({}) | list) }}
+
+    # Le sous-ensemble qui bouge. Evalue a l'usage, donc toujours a jour vis-a-vis
+    # de `_table` -- les phases `pull` et `apply` bouclent la-dessus et rien d'autre.
+    _a_changer: "{{ (_table | default([])) | selectattr('change') | list }}"
+
+  tasks:
     - name: Fail early when the inventory declares nothing
       ansible.builtin.fail:
         msg: >-
@@ -55,63 +90,154 @@
       when: (vyos_container_images | default({})) | length == 0
       tags: always
 
-  tasks:
-    - name: bind9
-      ansible.builtin.include_tasks:
-        file: tasks/update-one-image.yml
-        apply:
-          tags: [images, bind9]
-      vars:
-        _cible: bind9
-      when: _cible in (vyos_container_images | default({}))
-      tags: [images, bind9]
+    - name: Read the image tags currently configured
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+      register: _cfg
+      changed_when: false
+      check_mode: false
+      tags: always
 
-    - name: squid
-      ansible.builtin.include_tasks:
-        file: tasks/update-one-image.yml
-        apply:
-          tags: [images, squid]
+    # Le tableau de travail. Chaque entree porte deja son verdict (`change`),
+    # pour que les phases suivantes se contentent d'un `selectattr` au lieu de
+    # recomparer des chaines a chaque etape.
+    - name: Build the working table
+      ansible.builtin.set_fact:
+        _table: >-
+          {{ _table | default([]) + [{
+               'nom': item.key,
+               'voulue': item.value,
+               'actuelle': _en_place,
+               'change': _en_place != item.value
+             }] }}
       vars:
-        _cible: squid
-      when: _cible in (vyos_container_images | default({}))
-      tags: [images, squid]
+        _en_place: >-
+          {{ _cfg.stdout
+             | regex_findall("set container name " ~ item.key ~ " image '([^']+)'")
+             | first | default('') }}
+      loop: >-
+        {{ vyos_container_images | dict2items
+           | selectattr('key', 'in', _retenus) | list }}
+      loop_control:
+        label: "{{ item.key }}"
+      tags: always
 
-    - name: c-icap
-      ansible.builtin.include_tasks:
-        file: tasks/update-one-image.yml
-        apply:
-          tags: [images, c-icap]
-      vars:
-        _cible: c-icap
-      when: _cible in (vyos_container_images | default({}))
-      tags: [images, c-icap]
+    - name: Nothing selected
+      ansible.builtin.fail:
+        msg: >-
+          Aucun service retenu. `image_services` vaut « {{ image_services }} »,
+          or l'inventaire declare : {{ vyos_container_images | list | join(', ') }}.
+      when: (_table | default([])) | length == 0
+      tags: always
 
-    - name: clamav
-      ansible.builtin.include_tasks:
-        file: tasks/update-one-image.yml
-        apply:
-          tags: [images, clamav]
-      vars:
-        _cible: clamav
-      when: _cible in (vyos_container_images | default({}))
-      tags: [images, clamav]
+    # --- check ---------------------------------------------------------
 
-    - name: suricata
-      ansible.builtin.include_tasks:
-        file: tasks/update-one-image.yml
-        apply:
-          tags: [images, suricata]
-      vars:
-        _cible: suricata
-      when: _cible in (vyos_container_images | default({}))
-      tags: [images, suricata]
+    - name: "check — etat de chaque service"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.nom }} :
+          {{ (item.actuelle | default('(aucune)', true)) ~ ' -> ' ~ item.voulue
+             if item.change else 'deja en ' ~ item.voulue }}
+      loop: "{{ _table | default([]) }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      tags: [check, pull, apply]
 
-    - name: haproxy
-      ansible.builtin.include_tasks:
-        file: tasks/update-one-image.yml
-        apply:
-          tags: [images, haproxy]
-      vars:
-        _cible: haproxy
-      when: _cible in (vyos_container_images | default({}))
-      tags: [images, haproxy]
+    - name: "check — resume"
+      ansible.builtin.debug:
+        msg: >-
+          {{ _a_changer | length }} image(s) a mettre a jour sur
+          {{ (_table | default([])) | length }} declaree(s).
+      tags: [check, pull, apply]
+
+    # --- pull ----------------------------------------------------------
+    # Volontairement AVANT toute ecriture : un echec ici -- registre
+    # injoignable, tag inexistant -- laisse le routeur exactement dans l'etat
+    # ou on l'a trouve. Sans pre-tirage, le commit detruit le container
+    # existant avant d'echouer a creer le nouveau, et le service reste a terre.
+
+    - name: "pull — telecharger les images qui changent"
+      ansible.builtin.command:
+        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper add container image {{ item.voulue }}"
+      loop: "{{ _a_changer }}"
+      loop_control:
+        label: "{{ item.nom }} -> {{ item.voulue }}"
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [pull, apply]
+
+    # --- apply ---------------------------------------------------------
+    # Un seul appel : `begin`/`set`/`commit`/`save`/`end` ne survivent pas a un
+    # changement de shell, et chaque tache Ansible en ouvre un neuf.
+    # `source /etc/default/vyatta` avec `;` est obligatoire, sinon
+    # `$vyos_validators_dir` est vide et tout validateur echoue.
+
+    - name: "apply — poser les tags, commit et save"
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          source /etc/default/vyatta;
+          W=/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper
+          $W begin
+          {% for i in _a_changer %}
+          $W set container name {{ i.nom }} image '{{ i.voulue }}'
+          {% endfor %}
+          $W commit
+          $W save
+          $W end
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - _a_changer | length > 0
+        - not ansible_check_mode
+      tags: [apply]
+
+    # Le wrapper est SILENCIEUX quand il reussit : une sortie vide n'est ni un
+    # echec ni un commit en cours. La seule preuve est de relire.
+
+    - name: "apply — relire la configuration"
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+      register: _cfg_apres
+      changed_when: false
+      when:
+        - _a_changer | length > 0
+        - not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — verifier que le routeur montre bien l'image declaree"
+      ansible.builtin.assert:
+        that:
+          - (_cfg_apres.stdout
+             | regex_findall("set container name " ~ item.nom ~ " image '([^']+)'")
+             | first | default('')) == item.voulue
+        fail_msg: >-
+          « {{ item.nom }} » devait passer en {{ item.voulue }}, la configuration
+          montre {{ (_cfg_apres.stdout
+                     | regex_findall("set container name " ~ item.nom ~ " image '([^']+)'")
+                     | first | default('(rien)')) }}.
+        success_msg: "{{ item.nom }} : {{ item.voulue }}"
+        quiet: true
+      loop: "{{ _a_changer }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      when:
+        - _a_changer | length > 0
+        - not ansible_check_mode
+      tags: [apply]
+
+    # Le commit a recree les containers HORS du chemin systemd. Pour squid,
+    # cela fait disparaitre les regles nft REDIRECT en silence et tout le VLAN
+    # perd HTTPS -- sans qu'aucune sonde applicative ne bronche, le proxy
+    # lui-meme allant tres bien. `restart container` repasse par l'unite
+    # systemd, qui redeclenche le service de redirection.
+
+    - name: "apply — redemarrer par systemd"
+      ansible.builtin.command:
+        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper restart container {{ item.nom }}"
+      loop: "{{ _a_changer }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [apply]
