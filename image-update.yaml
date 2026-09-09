@@ -132,7 +132,10 @@
                'nom': item.key,
                'voulue': item.value,
                'actuelle': _en_place,
-               'change': _en_place != item.value
+               'change': _en_place != item.value,
+               'retrograde': (_en_place | length) > 0
+                             and (_en_place.split(':') | last)
+                                 is version((item.value.split(':') | last), '>')
              }] }}
       vars:
         _en_place: >-
@@ -154,13 +157,37 @@
       when: (_table | default([])) | length == 0
       tags: always
 
+    # Une image plus ancienne que celle qui tourne n'est presque jamais voulue :
+    # c'est le symptome d'un inventaire en retard, pas d'une decision. Le cas
+    # s'est produit -- l'inventaire declarait suricata 8.0.6.18 alors que le
+    # routeur tournait en 8.0.6.20. On refuse par defaut.
+    - name: Refuse to downgrade unless asked explicitly
+      ansible.builtin.fail:
+        msg: >-
+          RETROGRADATION refusee :
+          {% for i in _a_retrograder %}
+          {{ i.nom }} tourne en {{ i.actuelle.split(':') | last }} et l'inventaire
+          declare {{ i.voulue.split(':') | last }}{{ ', ' if not loop.last else '' }}
+          {%- endfor %}.
+          L'inventaire est probablement en retard : relevez ce qui tourne avec
+          « show configuration commands | grep 'container name .* image' », ou
+          portez-le au dernier tag publie. Si la retrogradation est voulue,
+          relancez avec -e allow_downgrade=true.
+      when:
+        - not (allow_downgrade | default(false) | bool)
+        - (_a_retrograder | length) > 0
+      vars:
+        _a_retrograder: "{{ (_table | default([])) | selectattr('retrograde') | list }}"
+      tags: always
+
     # --- check ---------------------------------------------------------
 
     - name: "check — etat de chaque service"
       ansible.builtin.debug:
         msg: >-
           {{ item.nom }} :
-          {{ (item.actuelle | default('(aucune)', true)) ~ ' -> ' ~ item.voulue
+          {{ ((item.actuelle | default('(aucune)', true)) ~ ' -> ' ~ item.voulue
+              ~ ('   [RETROGRADATION]' if item.retrograde else ''))
              if item.change else 'deja en ' ~ item.voulue }}
       loop: "{{ _table | default([]) }}"
       loop_control:
@@ -201,7 +228,11 @@
       ansible.builtin.shell:
         cmd: |
           set -e
-          source /etc/default/vyatta;
+          # `source /etc/default/vyatta` sort en 1 sur VyOS (verifie) alors qu'il
+          # a bien peuple $vyos_validators_dir. Sans `|| true`, `set -e` tue le
+          # script ICI : rc=1, aucune sortie, 4 ms. On garde `set -e` pour la
+          # suite -- on VEUT abandonner si un `set` ou le `commit` echoue.
+          source /etc/default/vyatta || true
           W=/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper
           $W begin
           {% for i in _a_changer %}
