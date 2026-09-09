@@ -337,26 +337,37 @@
     # --- apply ---------------------------------------------------------
     # Un seul appel : `begin`/`set`/`commit`/`save`/`end` ne survivent pas a un
     # changement de shell, et chaque tache Ansible en ouvre un neuf.
-    # `source /etc/default/vyatta` avec `;` est obligatoire, sinon
-    # `$vyos_validators_dir` est vide et tout validateur echoue.
+    #
+    # Trois details, tous payes une fois :
+    #
+    # 1. `source /etc/default/vyatta` sort en 1 sur VyOS alors qu'il a bien
+    #    peuple `$vyos_validators_dir`. Sans `|| true`, `set -e` tue le script
+    #    ICI : rc=1, aucune sortie, 4 ms.
+    # 2. Le wrapper exige le groupe `vyattacfg` (c'est ecrit en tete de
+    #    `/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper`). L'utilisateur Ansible en
+    #    est membre, mais ce n'est pas son groupe primaire : d'ou le `sg`.
+    # 3. `end` (teardownSession) demonte l'unionfs de la session. Il a rendu 1
+    #    le 2026-09-09 APRES un `commit` et un `save` tous deux reussis : la
+    #    tache a signale un echec sur une operation entierement passee, et les
+    #    deux taches de verification qui suivent n'ont jamais tourne. Le
+    #    demontage est du menage, il n'a pas a decider du sort de la tache --
+    #    la preuve, c'est la relecture de la configuration, plus bas.
 
     - name: "apply — poser les tags, commit et save"
       ansible.builtin.shell:
         cmd: |
+          sg vyattacfg -c '
           set -e
-          # `source /etc/default/vyatta` sort en 1 sur VyOS (verifie) alors qu'il
-          # a bien peuple $vyos_validators_dir. Sans `|| true`, `set -e` tue le
-          # script ICI : rc=1, aucune sortie, 4 ms. On garde `set -e` pour la
-          # suite -- on VEUT abandonner si un `set` ou le `commit` echoue.
           source /etc/default/vyatta || true
           W=/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper
           $W begin
           {% for i in _a_changer %}
-          $W set container name {{ i.nom }} image '{{ i.voulue }}'
+          $W set container name {{ i.nom }} image "{{ i.voulue }}"
           {% endfor %}
           $W commit
           $W save
-          $W end
+          $W end || echo "AVERTISSEMENT: teardownSession a rendu $?, la session reste montee sous /opt/vyatta/config/tmp/" >&2
+          '
         executable: /bin/bash
       changed_when: true
       when:
@@ -412,4 +423,29 @@
         label: "{{ item.nom }}"
       changed_when: true
       when: not ansible_check_mode
+      tags: [apply]
+
+    # Une session dont le `end` a echoue laisse son unionfs monte. C'est sans
+    # consequence pour le service et ca disparait au redemarrage du routeur,
+    # mais il n'y a aucun moyen de le nettoyer sans root -- donc on le dit.
+
+    - name: "apply — compter les sessions de configuration residuelles"
+      ansible.builtin.shell:
+        cmd: "ls -d /opt/vyatta/config/tmp/new_config_* 2>/dev/null | wc -l"
+      register: _sessions_restantes
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — signaler les sessions residuelles"
+      ansible.builtin.debug:
+        msg: >-
+          {{ _sessions_restantes.stdout | trim }} session(s) de configuration
+          restent montees sous /opt/vyatta/config/tmp/ : un `end` a echoue a
+          demonter son unionfs. Sans effet sur le service, nettoye au
+          redemarrage du routeur.
+      when:
+        - not ansible_check_mode
+        - (_sessions_restantes.stdout | default('0') | trim | int) > 0
       tags: [apply]
