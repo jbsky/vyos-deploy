@@ -122,6 +122,24 @@
            | length) == 0
       tags: always
 
+    # `vyos_container_images` est lu au demarrage du play. `latest -e
+    # write_inventory=true` reecrit le FICHIER, pas la variable en memoire :
+    # enchainer `apply` dans le meme run appliquerait donc les ANCIENNES
+    # valeurs pendant que l'inventaire sur disque en annonce de nouvelles.
+    # Silencieux, et faux. On refuse -- le diff doit etre relu entre les deux.
+    - name: Writing the inventory and applying in one run
+      ansible.builtin.fail:
+        msg: >-
+          `-e write_inventory=true` avec la phase `apply` dans le meme appel :
+          l'inventaire serait reecrit sur disque mais `apply` utiliserait les
+          valeurs chargees au demarrage, donc les anciennes. Faites-en deux :
+          --tags latest -e write_inventory=true, relisez le `git diff`,
+          committez, puis --tags apply.
+      when:
+        - write_inventory | default(false) | bool
+        - "'apply' in (ansible_run_tags | default([]))"
+      tags: always
+
     - name: Read the image tags currently configured
       ansible.builtin.command:
         cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
