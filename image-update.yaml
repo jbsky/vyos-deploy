@@ -46,18 +46,20 @@
 # savoir avant d'avoir touche a la configuration.
 #
 # ---------------------------------------------------------------------
-#  Restreindre a un service
+#  Choisir les services -- avec les memes tags
 # ---------------------------------------------------------------------
 #
-#   ansible-playbook image-update.yaml -e image_services=squid
-#   ansible-playbook image-update.yaml -e image_services=bind9,clamav
+# Un nom de service en tag ne selectionne aucune tache : il filtre le tableau.
+# Phases et services se combinent donc librement.
 #
-# SANS ESPACE apres la virgule : `-e` decoupe ses arguments sur l'espace, et
-# « bind9, clamav » serait lu comme la valeur « bind9, » suivie d'une seconde
-# paire clef=valeur. Verifie -- seul bind9 est alors retenu, en silence.
+#   --tags squid,check          verifier squid seulement
+#   --tags squid                squid seul, les trois phases
+#   --tags bind9,clamav,pull    telecharger pour ces deux-la
+#   --skip-tags clamav          tout sauf clamav
+#   --skip-tags clamav,suricata tout sauf ces deux-la
 #
-# Restreindre limite aussi la transaction : un seul service selectionne donne
-# un seul `commit`.
+# Restreindre limite aussi la transaction : un seul service retenu donne un
+# seul `commit`.
 #
 # A LANCER PAR LA CHAINE CI, jamais a la main : ce playbook touche le DNS et
 # le proxy, et un routeur casse s'isole de la machine qui voudrait le
@@ -68,14 +70,20 @@
   gather_facts: false
 
   vars:
-    # Vide = tous les services declares. Sinon, noms separes par des virgules.
-    image_services: ""
+    _declares: "{{ vyos_container_images | default({}) | list }}"
 
-    # Les services retenus : tout l'inventaire, ou la selection demandee.
+    # Les tags servent DEUX choses a la fois : choisir la phase (check / pull /
+    # apply, qui selectionnent des taches comme d'habitude) et choisir les
+    # services. Un nom de service en tag ne selectionne aucune tache -- il
+    # filtre le TABLEAU, via `ansible_run_tags` / `ansible_skip_tags`. C'est ce
+    # qui permet de garder une seule boucle plutot qu'un bloc par service.
+    _tags_inclus: "{{ ansible_run_tags | default([]) | intersect(_declares) }}"
+    _tags_exclus: "{{ ansible_skip_tags | default([]) | intersect(_declares) }}"
+
+    # Les services retenus : ceux nommes en tag, sinon tous, moins les exclus.
     _retenus: >-
-      {{ (image_services | split(',') | map('trim') | select | list)
-         if (image_services | length) > 0
-         else (vyos_container_images | default({}) | list) }}
+      {{ (_tags_inclus if (_tags_inclus | length) > 0 else _declares)
+         | difference(_tags_exclus) }}
 
     # Le sous-ensemble qui bouge. Evalue a l'usage, donc toujours a jour vis-a-vis
     # de `_table` -- les phases `pull` et `apply` bouclent la-dessus et rien d'autre.
@@ -88,6 +96,22 @@
           `vyos_container_images` est vide ou absent : ce playbook n'a rien a
           appliquer. Declarez les images attendues dans l'inventaire.
       when: (vyos_container_images | default({})) | length == 0
+      tags: always
+
+    # `--tags squid` seul ne selectionne aucune tache : les phases portent les
+    # tags check/pull/apply, pas les noms de service. Sans ce garde, le playbook
+    # sortirait vert en n'ayant rien fait -- le pire des resultats.
+    - name: A service tag needs a phase
+      ansible.builtin.fail:
+        msg: >-
+          « {{ _tags_inclus | join(', ') }} » designe des services, pas des phases :
+          aucune tache ne serait executee. Ajoutez une phase --
+          --tags {{ _tags_inclus | join(',') }},check (ou pull, ou apply) --
+          ou utilisez --skip-tags pour exclure au lieu d'inclure.
+      when:
+        - (_tags_inclus | length) > 0
+        - (ansible_run_tags | default([]) | intersect(['check', 'pull', 'apply'])
+           | length) == 0
       tags: always
 
     - name: Read the image tags currently configured
@@ -147,7 +171,8 @@
       ansible.builtin.debug:
         msg: >-
           {{ _a_changer | length }} image(s) a mettre a jour sur
-          {{ (_table | default([])) | length }} declaree(s).
+          {{ (_table | default([])) | length }} retenue(s)
+          {{ '(sur ' ~ (_declares | length) ~ ' declarees)' if (_retenus | length) < (_declares | length) else '' }}.
       tags: [check, pull, apply]
 
     # --- pull ----------------------------------------------------------
