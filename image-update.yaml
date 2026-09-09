@@ -1,36 +1,46 @@
 ---
 # ansible-playbook image-update.yaml -i <ton-inventaire>
 #
-# Aligne les images des containers VyOS sur ce que declare l'inventaire.
+# Telecharge l'image declaree par l'inventaire et pose son tag dans la
+# configuration du routeur, service par service.
 #
-# C'est le SEUL playbook de ce depot qui modifie la configuration du
-# routeur. Les autres (`<service>-deploy.yaml`) deploient des fichiers de
-# configuration et se contentent de CONSTATER une derive d'image, en
-# lecture seule. La separation est deliberee : deployer une conf ne doit
-# jamais changer une version d'image en passant.
+# C'est le SEUL playbook de ce depot qui modifie `config.boot`. Les autres
+# (`<service>-deploy.yaml`) deploient des fichiers de configuration et se
+# contentent de CONSTATER une derive d'image, en lecture seule. La
+# separation est deliberee : deployer une conf ne doit jamais changer une
+# version d'image en passant.
 #
 # Source de verite : `vyos_container_images` dans l'inventaire.
 #
 #   vyos_container_images:
-#     bind9:  docker.io/jbsky/bind9-hardened:9.20.27.9
-#     squid:  docker.io/jbsky/squid-hardened:7.7.4
+#     bind9: docker.io/jbsky/bind9-hardened:9.20.27.9
+#     squid: docker.io/jbsky/squid-hardened:7.7.7
 #
-# La reference doit etre COMPLETE. `registries.conf` declare un registre de
-# recherche par defaut qui n'est pas Docker Hub : un nom court interroge le
-# mauvais registre et echoue.
+# La reference doit etre COMPLETE : `registries.conf` declare un registre de
+# recherche par defaut qui n'est pas Docker Hub, et un nom court interroge le
+# mauvais registre. Epingler le tag qui porte le compteur de revision -- la
+# version amont seule et `latest` sont reecrites en place a chaque rebuild.
 #
-# Deroule : pre-tirage -> une seule transaction set/commit/save ->
-# relecture de la configuration -> redemarrage par systemd.
+# ---------------------------------------------------------------------
+#  Tags Ansible : un par service
+# ---------------------------------------------------------------------
 #
-# A LANCER PAR LA CHAINE CI, jamais a la main : ce playbook touche le DNS
-# et le proxy, et un routeur casse s'isole de la machine qui voudrait le
-# reparer. Garder la porte manuelle (workflow_dispatch) cote CI.
+#   ansible-playbook image-update.yaml                    # tous les services
+#   ansible-playbook image-update.yaml --tags squid       # squid seul
+#   ansible-playbook image-update.yaml --tags bind9,clamav
+#   ansible-playbook image-update.yaml --check            # ne change rien
 #
-# Simulation (ne change rien, dit ce qui changerait) :
-#   ansible-playbook image-update.yaml --check
+# Un service absent de `vyos_container_images` est saute sans erreur : le
+# depot reste utilisable avec un inventaire partiel.
 #
-# Cibler un seul container :
-#   ansible-playbook image-update.yaml -e '{"vyos_container_images":{"bind9":"docker.io/jbsky/bind9-hardened:9.20.27.9"}}'
+# Chaque service est traite de bout en bout et INDEPENDAMMENT : pre-tirage,
+# set/commit/save, relecture, redemarrage. bind9 et squid n'ont rien a voir
+# l'un avec l'autre, une transaction commune les rendrait solidaires sans
+# raison -- un echec sur l'un laisse les autres intacts.
+#
+# A LANCER PAR LA CHAINE CI, jamais a la main : ce playbook touche le DNS et
+# le proxy, et un routeur casse s'isole de la machine qui voudrait le
+# reparer. Garder la porte manuelle (`workflow_dispatch`) cote CI.
 
 - name: Align VyOS container images with the inventory
   hosts: vyos
@@ -40,11 +50,68 @@
     - name: Fail early when the inventory declares nothing
       ansible.builtin.fail:
         msg: >-
-          `vyos_container_images` est vide ou absent. Ce playbook n'a rien a
-          appliquer -- declarez les images attendues dans l'inventaire.
+          `vyos_container_images` est vide ou absent : ce playbook n'a rien a
+          appliquer. Declarez les images attendues dans l'inventaire.
       when: (vyos_container_images | default({})) | length == 0
+      tags: always
 
   tasks:
-    - name: Update the container images
-      ansible.builtin.include_tasks: tasks/update-container-images.yml
-      tags: [images]
+    - name: bind9
+      ansible.builtin.include_tasks:
+        file: tasks/update-one-image.yml
+        apply:
+          tags: [images, bind9]
+      vars:
+        _cible: bind9
+      when: _cible in (vyos_container_images | default({}))
+      tags: [images, bind9]
+
+    - name: squid
+      ansible.builtin.include_tasks:
+        file: tasks/update-one-image.yml
+        apply:
+          tags: [images, squid]
+      vars:
+        _cible: squid
+      when: _cible in (vyos_container_images | default({}))
+      tags: [images, squid]
+
+    - name: c-icap
+      ansible.builtin.include_tasks:
+        file: tasks/update-one-image.yml
+        apply:
+          tags: [images, c-icap]
+      vars:
+        _cible: c-icap
+      when: _cible in (vyos_container_images | default({}))
+      tags: [images, c-icap]
+
+    - name: clamav
+      ansible.builtin.include_tasks:
+        file: tasks/update-one-image.yml
+        apply:
+          tags: [images, clamav]
+      vars:
+        _cible: clamav
+      when: _cible in (vyos_container_images | default({}))
+      tags: [images, clamav]
+
+    - name: suricata
+      ansible.builtin.include_tasks:
+        file: tasks/update-one-image.yml
+        apply:
+          tags: [images, suricata]
+      vars:
+        _cible: suricata
+      when: _cible in (vyos_container_images | default({}))
+      tags: [images, suricata]
+
+    - name: haproxy
+      ansible.builtin.include_tasks:
+        file: tasks/update-one-image.yml
+        apply:
+          tags: [images, haproxy]
+      vars:
+        _cible: haproxy
+      when: _cible in (vyos_container_images | default({}))
+      tags: [images, haproxy]
