@@ -11,11 +11,22 @@
 #  et interroger avec `dig -b`. named voit alors la requete comme venant
 #  de ce sous-reseau et selectionne la vue correspondante.
 #
-#  Usage : test-views.sh <named.conf.local> [nom_a_resoudre]
+#  Usage : test-views.sh <named.conf.local> <nom_interne> <nom_public>
+#
+#  Aucun des deux noms n'a de valeur par defaut, volontairement. Ce depot
+#  est public : un defaut y ferait entrer une infrastructure precise, et
+#  personne ne le relirait ensuite. Le precedent defaut pointait d'ailleurs
+#  sur un hote decommissionne depuis des mois, sans que rien ne le signale.
+#
+#    <nom_interne> un nom servi par TOUTES les vues de sous-reseau
+#    <nom_public>  une zone servie par la vue `internet`, qui ne sert pas
+#                  les zones internes -- c'est ce qui rend le controle de
+#                  discrimination plus bas capable d'echouer
 # =====================================================================
 set -u
-CONF=${1:?usage: test-views.sh <named.conf.local> [nom]}
-NAME=${2:-registry.home.arpa}
+CONF=${1:?usage: test-views.sh <named.conf.local> <nom_interne> <nom_public>}
+NAME=${2:?usage: test-views.sh <named.conf.local> <nom_interne> <nom_public>}
+PUBLIC=${3:?usage: test-views.sh <named.conf.local> <nom_interne> <nom_public>}
 RC=0
 
 # --- vues et sous-reseaux, extraits de la conf elle-meme (jamais d'une
@@ -60,10 +71,11 @@ for ligne in "${VUES[@]}"; do
     case "$vue" in
       internet)
         src=203.0.113.1                       # TEST-NET-3, RFC 5737
-        q=jbsky.fr
+        q=$PUBLIC
         ip addr add "$src/32" dev lo 2>/dev/null
         out=$(dig -b "$src" @127.0.0.1 "$q" +short +time=3 +tries=1 2>/dev/null)
-        # Controle de discrimination : cette vue ne sert PAS home.arpa et
+        # Controle de discrimination : cette vue ne sert PAS les zones
+        # internes et
         # tourne en `recursion no`. Une reponse ici voudrait dire qu'on est
         # tombe dans une autre vue, donc que le test ne teste rien.
         fuite=$(dig -b "$src" @127.0.0.1 "$NAME" +short +time=3 +tries=1 2>/dev/null)
@@ -75,7 +87,7 @@ for ligne in "${VUES[@]}"; do
         ;;
       *)
         src=127.0.0.1
-        out=$(dig -b "$src" @127.0.0.1 jbsky.fr +short +time=3 +tries=1 2>/dev/null)
+        out=$(dig -b "$src" @127.0.0.1 "$PUBLIC" +short +time=3 +tries=1 2>/dev/null)
         ;;
     esac
   else
