@@ -338,7 +338,7 @@
     # Un seul appel : `begin`/`set`/`commit`/`save`/`end` ne survivent pas a un
     # changement de shell, et chaque tache Ansible en ouvre un neuf.
     #
-    # Trois details, tous payes une fois :
+    # Quatre details, tous payes une fois :
     #
     # 1. `source /etc/default/vyatta` sort en 1 sur VyOS alors qu'il a bien
     #    peuple `$vyos_validators_dir`. Sans `|| true`, `set -e` tue le script
@@ -352,8 +352,20 @@
     #    deux taches de verification qui suivent n'ont jamais tourne. Le
     #    demontage est du menage, il n'a pas a decider du sort de la tache --
     #    la preuve, c'est la relecture de la configuration, plus bas.
+    # 4. `become: false`. Un inventaire qui declare `ansible_become: true` pour
+    #    l'hote fait jouer CETTE tache en root, et un commit joue en root laisse
+    #    les noeuds de `/opt/vyatta/config/active/` sans le groupe `vyattacfg`.
+    #    Constate le 2026-09-10 : plus aucune modification n'etait possible en
+    #    utilisateur normal -- `configure` s'ouvrait, le `commit` echouait, parce
+    #    que c'est lui qui ecrit dans `active/`. Le mecanisme exact n'est PAS
+    #    etabli (le `sg` ci-dessus aurait du suffire) ; le declencheur, lui, l'est.
+    #    La tache n'a de toute facon aucun besoin de root : `sg vyattacfg` donne
+    #    au wrapper tout ce qu'il exige, et c'est la forme exacte d'un commit
+    #    interactif. Ne pas rendre l'hote entier `become: false` pour autant --
+    #    les taches qui deposent des fichiers de conf, elles, en ont besoin.
 
     - name: "apply — poser les tags, commit et save"
+      become: false
       ansible.builtin.shell:
         cmd: |
           sg vyattacfg -c '
