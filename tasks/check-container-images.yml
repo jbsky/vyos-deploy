@@ -17,6 +17,20 @@
 #
 # Sans cette variable, la boucle porte sur une liste vide : aucun effet, le
 # depot reste utilisable tel quel hors de tout inventaire.
+#
+# Tolerance des revisions de build (`vyos_container_images_ignore_build_revision`,
+# false par defaut). Les images jbsky/*-hardened sont taguees
+# <version amont>.<revision de build> : 9.20.27.10 est BIND 9.20.27, dans sa
+# dixieme reconstruction (nouvel Alpine, correctif de CVE, changement du
+# Dockerfile). Une reconstruction ne change pas la semantique de la
+# configuration ; une version amont, si -- c'est l'incident ClamAV 1.4 -> 1.5
+# ci-dessus. A true, deux tags qui ne different que par leur dernier composant
+# numerique passent ; tout le reste echoue toujours.
+#
+# Strict par defaut, et pas l'inverse : sur une image taguee sans revision
+# (bind:9.20.27), la meme regle confondrait 9.20.27 et 9.20.28, et laisserait
+# passer precisement le changement amont que ce controle doit arreter. N'activer
+# la tolerance que pour des images dont le dernier composant EST une revision.
 
 - name: Read the container image tags from the running VyOS config
   ansible.builtin.command:
@@ -41,15 +55,32 @@
 
 - name: Fail when the router runs an image the inventory does not declare
   ansible.builtin.assert:
+    # Deux references egales, ou -- si la tolerance est activee -- egales une
+    # fois retire UN dernier composant numerique de chaque tag. La reference
+    # vide (conteneur introuvable) ne peut jamais passer.
     that:
-      - _running_container_images[item] == vyos_container_images[item]
+      - >-
+        (_running_container_images[item] | default('')) | length > 0
+        and (
+          _running_container_images[item] == vyos_container_images[item]
+          or (
+            (vyos_container_images_ignore_build_revision | default(false) | bool)
+            and (_running_container_images[item] | regex_replace('\\.[0-9]+$', ''))
+                == (vyos_container_images[item] | regex_replace('\\.[0-9]+$', ''))
+          )
+        )
     fail_msg: >-
       Derive d'image sur « {{ item }} » : l'inventaire declare
       {{ vyos_container_images[item] }}, le routeur fait tourner
       {{ _running_container_images[item] | default('(rien)') or '(aucune image declaree)' }}.
       Aligner l'un sur l'autre avant de deployer -- la configuration de ce depot
       est ecrite pour la version declaree.
-    success_msg: "{{ item }} : {{ vyos_container_images[item] }}"
+      {{ '(Les revisions de build sont tolerees : la difference porte ici sur la version amont.)'
+         if (vyos_container_images_ignore_build_revision | default(false) | bool) else '' }}
+    success_msg: >-
+      {{ item }} : {{ vyos_container_images[item] }}{{
+         '' if _running_container_images[item] == vyos_container_images[item]
+         else ' (le routeur tourne en ' ~ _running_container_images[item] ~ ', meme version amont)' }}
     quiet: true
   loop: "{{ _checked_containers }}"
   tags: always

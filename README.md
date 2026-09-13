@@ -78,6 +78,31 @@ La vérification est en **lecture seule** : elle échoue bruyamment sur une
 dérive, elle ne réécrit jamais la configuration du routeur. Sans la variable,
 elle ne fait rien -- le dépôt reste utilisable tel quel.
 
+### Tolérer les reconstructions d'une même version
+
+Par défaut, la comparaison porte sur le tag **entier**. Les images
+`jbsky/*-hardened` sont taguées `<version amont>.<révision de build>` :
+`bind9-hardened:9.20.27.10` est BIND 9.20.27 dans sa dixième reconstruction
+(nouvel Alpine, correctif de CVE, Dockerfile modifié). Une reconstruction ne
+change pas la sémantique de la configuration ; une version amont, si.
+
+```yaml
+vyos_container_images_ignore_build_revision: true
+```
+
+Avec cette variable, deux tags qui ne diffèrent **que par leur dernier
+composant numérique** passent (`9.20.27.9` contre `9.20.27.10`) ; un changement
+de version amont échoue toujours (`1.4.3.2` contre `1.5.4.8`), tout comme un
+autre dépôt d'image ou un conteneur introuvable.
+
+**Ne l'active que pour des images dont le dernier composant est une révision.**
+Sur une image taguée `bind:9.20.27`, la même règle confondrait `9.20.27` et
+`9.20.28`, et laisserait passer précisément le changement amont que ce contrôle
+doit arrêter -- d'où la comparaison stricte par défaut.
+
+`image-update.yaml` n'est pas concerné : il compare toujours le tag complet, et
+refuse toujours de rétrograder.
+
 ### Appliquer la dérive plutôt que la constater
 
 `image-update.yaml` fait l'inverse : il pose sur le routeur les tags que
