@@ -67,12 +67,30 @@ l'alignement **avant** de déployer quoi que ce soit :
 ```yaml
 # host_vars/vyos.home.arpa/main.yaml
 vyos_container_images:
-  bind9: docker.io/jbsky/bind9-hardened:9.20.27
-  squid: docker.io/jbsky/squid-hardened:7.6
-  c-icap: docker.io/jbsky/c-icap-hardened:0.6.5
-  clamav: docker.io/jbsky/clamav-hardened:1.5.4
-  suricata: docker.io/jbsky/suricata-hardened:8.0.6
+  bind9: docker.io/jbsky/bind9-hardened
+  squid: docker.io/jbsky/squid-hardened
+  c-icap: docker.io/jbsky/c-icap-hardened
+  clamav: docker.io/jbsky/clamav-hardened
+  suricata: docker.io/jbsky/suricata-hardened
 ```
+
+**Pas de version dans l'inventaire : elle se calcule.** La version attendue est
+le dernier tag *immuable* publié sur Docker Hub, c'est-à-dire un tag dont un
+autre tag est un préfixe strict (`7.7.7` sous `7.7`). `latest` et la version
+amont seule sont réécrits à chaque reconstruction, ils ne sont jamais retenus.
+C'est aussi la version contre laquelle une CI qui tire `:latest` valide la
+configuration : le contrôle compare donc le routeur à ce qui a été validé.
+
+Un tag recopié dans l'inventaire prend du retard sans que rien ne le signale.
+Écrire un tag reste possible, et **épingle** le service sur cette version :
+
+```yaml
+  clamav: docker.io/jbsky/clamav-hardened:1.5.4.4   # retenu volontairement
+```
+
+Seul Docker Hub sait être interrogé : une image d'un autre registre doit être
+épinglée. Le calcul demande que la machine qui lance Ansible joigne
+`hub.docker.com`.
 
 La vérification est en **lecture seule** : elle échoue bruyamment sur une
 dérive, elle ne réécrit jamais la configuration du routeur. Sans la variable,
@@ -100,18 +118,23 @@ Sur une image taguée `bind:9.20.27`, la même règle confondrait `9.20.27` et
 `9.20.28`, et laisserait passer précisément le changement amont que ce contrôle
 doit arrêter -- d'où la comparaison stricte par défaut.
 
+Avec des versions calculées, c'est cette tolérance qui évite de bloquer tout
+déploiement à chaque reconstruction publiée, tant que `image-update.yaml` n'est
+pas passé. Une nouvelle version amont, elle, bloque : c'est voulu.
+
 `image-update.yaml` n'est pas concerné : il compare toujours le tag complet, et
 refuse toujours de rétrograder.
 
 ### Appliquer la dérive plutôt que la constater
 
-`image-update.yaml` fait l'inverse : il pose sur le routeur les tags que
-l'inventaire déclare.
+`image-update.yaml` fait l'inverse : il pose sur le routeur la version attendue
+(calculée, ou épinglée par l'inventaire).
 
 ```bash
 ansible-playbook image-update.yaml --tags check    # constate, ne touche a rien
 ansible-playbook image-update.yaml --tags pull     # telecharge seulement
 ansible-playbook image-update.yaml                 # tout : check, pull, apply
+ansible-playbook image-update.yaml --tags prune    # supprime les images inutilisees
 ansible-playbook image-update.yaml --check         # simulation Ansible
 ```
 
@@ -128,6 +151,24 @@ ansible-playbook image-update.yaml --skip-tags clamav          # tout sauf clama
 Restreindre limite aussi la transaction : un seul service retenu donne un seul
 `commit`. Et un nom de service **sans phase** echoue avec un message explicite
 plutot que de sortir vert sans rien faire.
+
+#### `prune` : supprimer les images inutilisées
+
+Chaque mise à jour laisse l'image précédente sur le routeur. `prune` supprime
+celles qu'**aucun conteneur n'utilise et qu'aucune ligne `image` de la
+configuration ne désigne**, par identifiant, une à une, par la commande op-mode
+(jamais `delete container image all`).
+
+- Elle n'est **jamais comprise dans « tout »** : il faut la demander. Supprimer
+  l'image précédente, c'est renoncer à un retour arrière sans retéléchargement.
+- Elle est **globale** : elle porte sur toutes les images du routeur, y compris
+  celles de conteneurs absents de l'inventaire, et un nom de service ne la
+  restreint pas.
+- Elle se **vérifie** après coup : chaque image désignée par la configuration
+  doit encore être là. Vérifier que « les conteneurs tournent » ne prouve rien :
+  un conteneur survit à son image, l'absence ne se paie qu'au prochain `commit`
+  ou `restart container`.
+- `--check` affiche ce qui serait supprimé, sans rien supprimer.
 
 Il est **séparé des playbooks de déploiement**, et c'est délibéré : déployer une
 configuration ne doit jamais changer une version d'image en passant. Les

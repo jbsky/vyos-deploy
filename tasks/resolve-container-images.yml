@@ -1,0 +1,100 @@
+---
+# Calcule la reference COMPLETE attendue pour chaque service de
+# `vyos_container_images`. Partage par `image-update.yaml` (ce qu'il faut
+# poser) et `check-container-images.yml` (ce qui doit tourner).
+#
+# Entree : `_images_a_resoudre`, liste de clefs de `vyos_container_images`.
+# Sortie : `_images_attendues`, nom -> reference taguee.
+#
+# Deux formes dans l'inventaire :
+#
+#   squid: docker.io/jbsky/squid-hardened         # calcule : dernier tag immuable publie
+#   squid: docker.io/jbsky/squid-hardened:7.7.4   # epingle : pris tel quel
+#
+# La forme calculee est la forme normale. Un tag recopie dans l'inventaire
+# prend du retard sur le registre sans que rien ne le signale, et le retard
+# se paie deux fois : `image-update.yaml` applique une version perimee, et le
+# controle de derive des `<service>-deploy.yaml` compare le routeur a une
+# version qui n'est plus celle contre laquelle une CI qui tire `:latest`
+# valide la configuration. L'epinglage reste la pour retenir un service sur
+# une version donnee, en connaissance de cause.
+#
+# Regle du tag immuable : chaque image publie `latest`, la version amont
+# seule, et la version amont suffixee d'un compteur de revision. Les deux
+# premieres sont REECRITES EN PLACE a chaque rebuild. Un tag n'est donc
+# retenu que s'il existe un autre tag qui en est un prefixe strict -- « 7.7 »
+# sous « 7.7.7 » prouve que le compteur a bien ete ajoute.
+#
+# Seul Docker Hub sait etre interroge. Une reference d'un autre registre doit
+# etre epinglee.
+
+- name: "images — separer les references epinglees de celles a calculer"
+  ansible.builtin.set_fact:
+    # Un tag se lit dans le DERNIER composant du chemin : le « : » d'un
+    # registre avec port (registre:5000/depot) n'en est pas un.
+    _images_attendues: >-
+      {{ vyos_container_images | dict2items
+         | selectattr('key', 'in', _images_a_resoudre)
+         | selectattr('value', 'search', ':[^/]+$') | items2dict }}
+    _images_a_calculer: >-
+      {{ vyos_container_images | dict2items
+         | selectattr('key', 'in', _images_a_resoudre)
+         | rejectattr('value', 'search', ':[^/]+$') | list }}
+
+- name: "images — le calcul ne sait interroger que Docker Hub"
+  ansible.builtin.assert:
+    that: item.value is match('docker\.io/')
+    fail_msg: >-
+      « {{ item.key }} » ({{ item.value }}) n'a pas de tag, et seul Docker Hub
+      sait etre interroge pour le calculer. Epinglez un tag dans l'inventaire.
+    quiet: true
+  loop: "{{ _images_a_calculer }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: "images — interroger Docker Hub"
+  ansible.builtin.uri:
+    url: "https://hub.docker.com/v2/repositories/{{ _depot }}/tags?page_size=100&ordering=last_updated"
+    return_content: true
+  register: _registre
+  vars:
+    _chemin: "{{ item.value | regex_replace('^docker\\.io/', '') }}"
+    # Les images officielles (`docker.io/haproxy`) vivent sous `library/`.
+    _depot: "{{ _chemin if '/' in _chemin else 'library/' ~ _chemin }}"
+  loop: "{{ _images_a_calculer }}"
+  loop_control:
+    label: "{{ item.key }}"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+
+- name: "images — retenir le dernier tag immuable"
+  ansible.builtin.set_fact:
+    _images_attendues: >-
+      {{ _images_attendues | combine({
+           item.item.key: item.item.value ~ ':' ~ _choisi } if _choisi else {}) }}
+  vars:
+    _noms: >-
+      {{ item.json.results | map(attribute='name')
+         | select('match', '^[0-9]+(\.[0-9]+)+$') | list }}
+    _immuables: >-
+      {{ _noms | select('match',
+           '^(' ~ (_noms | map('regex_escape') | join('|')) ~ ')\.') | list }}
+    _choisi: >-
+      {{ (_immuables | community.general.version_sort | last)
+         if (_immuables | length) > 0 else '' }}
+  loop: "{{ _registre.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: "images — chaque service a une reference taguee"
+  ansible.builtin.assert:
+    that: (_images_a_resoudre | difference(_images_attendues | list)) | length == 0
+    fail_msg: >-
+      Aucun tag immuable publie pour :
+      {{ _images_a_resoudre | difference(_images_attendues | list) | join(', ') }}.
+      Le registre ne publie peut-etre pas de tag suffixe d'une revision ;
+      epinglez un tag dans l'inventaire.
+    success_msg: >-
+      {% for k, v in _images_attendues.items() %}{{ k }} = {{ v.split(':') | last }}{{ ', ' if not loop.last else '' }}{% endfor %}

@@ -13,7 +13,12 @@
 # S'active en declarant `vyos_container_images` dans l'inventaire :
 #
 #   vyos_container_images:
-#     clamav: docker.io/jbsky/clamav-hardened:1.5.4.1
+#     clamav: docker.io/jbsky/clamav-hardened
+#
+# Sans tag, l'image attendue est le dernier tag immuable publie -- celle que
+# `image-update.yaml` appliquerait, et celle contre laquelle une CI qui tire
+# `:latest` valide la configuration. Un tag dans l'inventaire l'epingle. Le
+# calcul est dans tasks/resolve-container-images.yml.
 #
 # Sans cette variable, la boucle porte sur une liste vide : aucun effet, le
 # depot reste utilisable tel quel hors de tout inventaire.
@@ -25,12 +30,22 @@
 # Dockerfile). Une reconstruction ne change pas la semantique de la
 # configuration ; une version amont, si -- c'est l'incident ClamAV 1.4 -> 1.5
 # ci-dessus. A true, deux tags qui ne different que par leur dernier composant
-# numerique passent ; tout le reste echoue toujours.
+# numerique passent ; tout le reste echoue toujours. Avec des versions
+# calculees, c'est ce qui evite de bloquer un deploiement a chaque
+# reconstruction publiee, tant que `image-update.yaml` n'est pas passe.
 #
 # Strict par defaut, et pas l'inverse : sur une image taguee sans revision
 # (bind:9.20.27), la meme regle confondrait 9.20.27 et 9.20.28, et laisserait
 # passer precisement le changement amont que ce controle doit arreter. N'activer
 # la tolerance que pour des images dont le dernier composant EST une revision.
+
+- name: Compute the image each checked container should run
+  ansible.builtin.import_tasks: resolve-container-images.yml
+  vars:
+    _images_a_resoudre: >-
+      {{ _checked_containers | intersect(vyos_container_images | default({}) | list) }}
+  tags: always
+  when: (vyos_container_images | default({})) | length > 0
 
 - name: Read the container image tags from the running VyOS config
   ansible.builtin.command:
@@ -62,24 +77,24 @@
       - >-
         (_running_container_images[item] | default('')) | length > 0
         and (
-          _running_container_images[item] == vyos_container_images[item]
+          _running_container_images[item] == _images_attendues[item]
           or (
             (vyos_container_images_ignore_build_revision | default(false) | bool)
             and (_running_container_images[item] | regex_replace('\\.[0-9]+$', ''))
-                == (vyos_container_images[item] | regex_replace('\\.[0-9]+$', ''))
+                == (_images_attendues[item] | regex_replace('\\.[0-9]+$', ''))
           )
         )
     fail_msg: >-
-      Derive d'image sur « {{ item }} » : l'inventaire declare
-      {{ vyos_container_images[item] }}, le routeur fait tourner
+      Derive d'image sur « {{ item }} » : la version attendue est
+      {{ _images_attendues[item] }}, le routeur fait tourner
       {{ _running_container_images[item] | default('(rien)') or '(aucune image declaree)' }}.
-      Aligner l'un sur l'autre avant de deployer -- la configuration de ce depot
-      est ecrite pour la version declaree.
+      Aligner le routeur avant de deployer (image-update.yaml, phase apply) --
+      la configuration de ce depot est validee pour la version attendue.
       {{ '(Les revisions de build sont tolerees : la difference porte ici sur la version amont.)'
          if (vyos_container_images_ignore_build_revision | default(false) | bool) else '' }}
     success_msg: >-
-      {{ item }} : {{ vyos_container_images[item] }}{{
-         '' if _running_container_images[item] == vyos_container_images[item]
+      {{ item }} : {{ _images_attendues[item] }}{{
+         '' if _running_container_images[item] == _images_attendues[item]
          else ' (le routeur tourne en ' ~ _running_container_images[item] ~ ', meme version amont)' }}
     quiet: true
   loop: "{{ _checked_containers }}"

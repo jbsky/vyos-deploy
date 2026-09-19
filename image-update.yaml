@@ -1,8 +1,9 @@
 ---
 # ansible-playbook image-update.yaml -i <ton-inventaire>
 #
-# Telecharge les images declarees par l'inventaire et pose leurs tags dans la
-# configuration du routeur.
+# Telecharge la version attendue des images declarees par l'inventaire, pose
+# leurs tags dans la configuration du routeur, et supprime sur demande les
+# images qu'aucun conteneur n'utilise plus.
 #
 # C'est le SEUL playbook de ce depot qui modifie `config.boot`. Les autres
 # (`<service>-deploy.yaml`) deploient des fichiers de configuration et se
@@ -19,31 +20,29 @@
 # pas a connaitre les services.
 #
 #   vyos_container_images:
-#     bind9: docker.io/jbsky/bind9-hardened:9.20.27.9
-#     squid: docker.io/jbsky/squid-hardened:7.7.7
+#     bind9: docker.io/jbsky/bind9-hardened
+#     squid: docker.io/jbsky/squid-hardened
+#
+# SANS tag : la version se calcule, c'est le dernier tag immuable publie sur
+# Docker Hub (regle et raisons dans tasks/resolve-container-images.yml). Un
+# tag ecrit dans l'inventaire EPINGLE le service sur cette version -- a
+# reserver a une retenue voulue.
 #
 # La reference doit etre COMPLETE : `registries.conf` declare un registre de
 # recherche par defaut qui n'est pas Docker Hub, et un nom court interroge le
-# mauvais registre. Epingler le tag qui porte le compteur de revision -- la
-# version amont seule et `latest` sont reecrites en place a chaque rebuild.
+# mauvais registre.
 #
 # ---------------------------------------------------------------------
 #  Les phases
 # ---------------------------------------------------------------------
 #
-#   --tags latest   resout le dernier tag immuable publie, et le compare a
-#                   l'inventaire. Avec -e write_inventory=true, il PORTE
-#                   l'inventaire dessus (rien n'est envoye au routeur).
 #   --tags check    constate la derive, ne touche a rien
 #   --tags pull     telecharge les images seulement
 #   --tags apply    pose les tags, commit, save, verifie, redemarre
+#   --tags prune    supprime les images qu'aucun conteneur n'utilise. Jamais
+#                   comprise dans « tout » : il faut la demander.
 #
-# L'enchainement complet d'une mise a jour :
-#   --tags latest -e write_inventory=true    # porte l'inventaire
-#   git diff && git commit                    # relire, puis figer
-#   --tags apply                              # appliquer au routeur
-#
-#   ansible-playbook image-update.yaml                # tout
+#   ansible-playbook image-update.yaml                # tout (sauf prune)
 #   ansible-playbook image-update.yaml --tags check   # rapport seul
 #   ansible-playbook image-update.yaml --tags pull    # pre-charger sans rien changer
 #   ansible-playbook image-update.yaml --check        # simulation Ansible
@@ -104,7 +103,8 @@
           `vyos_container_images` est vide ou absent : ce playbook n'a rien a
           appliquer. Declarez les images attendues dans l'inventaire.
       when: (vyos_container_images | default({})) | length == 0
-      tags: always
+      # Pas `prune` : elle ne lit pas le tableau, elle porte sur tout le routeur.
+      tags: [check, pull, apply]
 
     # `--tags squid` seul ne selectionne aucune tache : les phases portent les
     # tags check/pull/apply, pas les noms de service. Sans ce garde, le playbook
@@ -118,26 +118,8 @@
           ou utilisez --skip-tags pour exclure au lieu d'inclure.
       when:
         - (_tags_inclus | length) > 0
-        - (ansible_run_tags | default([]) | intersect(['check', 'pull', 'apply'])
+        - (ansible_run_tags | default([]) | intersect(['check', 'pull', 'apply', 'prune'])
            | length) == 0
-      tags: always
-
-    # `vyos_container_images` est lu au demarrage du play. `latest -e
-    # write_inventory=true` reecrit le FICHIER, pas la variable en memoire :
-    # enchainer `apply` dans le meme run appliquerait donc les ANCIENNES
-    # valeurs pendant que l'inventaire sur disque en annonce de nouvelles.
-    # Silencieux, et faux. On refuse -- le diff doit etre relu entre les deux.
-    - name: Writing the inventory and applying in one run
-      ansible.builtin.fail:
-        msg: >-
-          `-e write_inventory=true` avec la phase `apply` dans le meme appel :
-          l'inventaire serait reecrit sur disque mais `apply` utiliserait les
-          valeurs chargees au demarrage, donc les anciennes. Faites-en deux :
-          --tags latest -e write_inventory=true, relisez le `git diff`,
-          committez, puis --tags apply.
-      when:
-        - write_inventory | default(false) | bool
-        - "'apply' in (ansible_run_tags | default([]))"
       tags: always
 
     - name: Read the image tags currently configured
@@ -148,6 +130,12 @@
       check_mode: false
       tags: always
 
+    - name: Compute the image each selected service should run
+      ansible.builtin.import_tasks: tasks/resolve-container-images.yml
+      vars:
+        _images_a_resoudre: "{{ _retenus }}"
+      tags: [check, pull, apply]
+
     # Le tableau de travail. Chaque entree porte deja son verdict (`change`),
     # pour que les phases suivantes se contentent d'un `selectattr` au lieu de
     # recomparer des chaines a chaque etape.
@@ -156,14 +144,15 @@
         _table: >-
           {{ _table | default([]) + [{
                'nom': item.key,
-               'voulue': item.value,
+               'voulue': _voulue,
                'actuelle': _en_place,
-               'change': _en_place != item.value,
+               'change': _en_place != _voulue,
                'retrograde': (_en_place | length) > 0
                              and (_en_place.split(':') | last)
-                                 is version((item.value.split(':') | last), '>')
+                                 is version((_voulue.split(':') | last), '>')
              }] }}
       vars:
+        _voulue: "{{ _images_attendues[item.key] }}"
         _en_place: >-
           {{ _cfg.stdout
              | regex_findall("set container name " ~ item.key ~ " image '([^']+)'")
@@ -173,31 +162,31 @@
            | selectattr('key', 'in', _retenus) | list }}
       loop_control:
         label: "{{ item.key }}"
-      tags: always
+      tags: [check, pull, apply]
 
     - name: Nothing selected
       ansible.builtin.fail:
         msg: >-
-          Aucun service retenu. `image_services` vaut « {{ image_services }} »,
-          or l'inventaire declare : {{ vyos_container_images | list | join(', ') }}.
+          Aucun service retenu par les tags, or l'inventaire declare :
+          {{ vyos_container_images | list | join(', ') }}.
       when: (_table | default([])) | length == 0
-      tags: always
+      tags: [check, pull, apply]
 
-    # Une image plus ancienne que celle qui tourne n'est presque jamais voulue :
-    # c'est le symptome d'un inventaire en retard, pas d'une decision. Le cas
-    # s'est produit -- l'inventaire declarait suricata 8.0.6.18 alors que le
-    # routeur tournait en 8.0.6.20. On refuse par defaut.
+    # Une image plus ancienne que celle qui tourne n'est presque jamais voulue.
+    # Le cas s'est produit quand l'inventaire portait les tags -- il declarait
+    # suricata 8.0.6.18 alors que le routeur tournait en 8.0.6.20. Avec des
+    # versions calculees, il reste deux causes : un epinglage ancien, ou un
+    # tag retire du registre apres avoir ete deploye. On refuse par defaut.
     - name: Refuse to downgrade unless asked explicitly
       ansible.builtin.fail:
         msg: >-
           RETROGRADATION refusee :
           {% for i in _a_retrograder %}
-          {{ i.nom }} tourne en {{ i.actuelle.split(':') | last }} et l'inventaire
-          declare {{ i.voulue.split(':') | last }}{{ ', ' if not loop.last else '' }}
+          {{ i.nom }} tourne en {{ i.actuelle.split(':') | last }}, la version
+          attendue est {{ i.voulue.split(':') | last }}{{ ', ' if not loop.last else '' }}
           {%- endfor %}.
-          L'inventaire est probablement en retard : relevez ce qui tourne avec
-          « show configuration commands | grep 'container name .* image' », ou
-          portez-le au dernier tag publie. Si la retrogradation est voulue,
+          Soit l'inventaire epingle une version ancienne, soit le registre ne
+          publie plus la version deployee. Si la retrogradation est voulue,
           relancez avec -e allow_downgrade=true.
       when:
         - not (allow_downgrade | default(false) | bool)
@@ -205,96 +194,9 @@
       vars:
         _a_retrograder: "{{ (_table | default([])) | selectattr('retrograde') | list }}"
       # Volontairement PAS `always` : ce garde protege le ROUTEUR, donc il ne
-      # concerne que les phases qui l'atteignent. Le tagger `always` bloquait
-      # `latest` -- c'est-a-dire la phase qui repare precisement la cause de la
-      # retrogradation. Et `check` doit rapporter, pas echouer.
+      # concerne que les phases qui l'atteignent. `check` doit rapporter, pas
+      # echouer.
       tags: [pull, apply]
-
-    # --- latest --------------------------------------------------------
-    # Resout le dernier tag IMMUABLE publie pour chaque service, et porte
-    # l'inventaire dessus. C'est l'etape qui manquait : sans elle, `apply`
-    # aligne le routeur sur un inventaire qui peut etre en retard -- et
-    # retrograde.
-    #
-    # Regle : chaque image publie `latest`, la version amont seule, et la
-    # version amont suffixee d'un compteur de revision. Les deux premieres
-    # sont REECRITES EN PLACE a chaque rebuild. Un tag n'est donc epinglable
-    # que s'il existe un autre tag qui en est un prefixe strict -- « 7.7 »
-    # sous « 7.7.7 » prouve que le compteur a bien ete ajoute.
-
-    - name: "latest — interroger le registre"
-      ansible.builtin.uri:
-        url: "https://hub.docker.com/v2/repositories/{{ _depot }}/tags?page_size=100"
-        return_content: true
-      register: _registre
-      loop: "{{ _table | default([]) }}"
-      loop_control:
-        label: "{{ item.nom }}"
-      vars:
-        _depot: >-
-          {{ item.voulue | regex_replace('^docker\.io/', '') | regex_replace(':.*$', '') }}
-      delegate_to: localhost
-      changed_when: false
-      tags: [latest]
-
-    - name: "latest — resoudre le dernier tag immuable"
-      ansible.builtin.set_fact:
-        _dernier: "{{ _dernier | default({}) | combine({ item.item.nom: _choisi }) }}"
-      vars:
-        _noms: "{{ item.json.results | map(attribute='name') | select('match', '^[0-9]+(\\.[0-9]+)+$') | list }}"
-        _immuables: >-
-          {{ _noms | select('match',
-               '^(' ~ (_noms | map('regex_escape') | join('|')) ~ ')\.') | list }}
-        _choisi: >-
-          {{ (_immuables | community.general.version_sort | last)
-             if (_immuables | length) > 0 else '' }}
-      loop: "{{ _registre.results }}"
-      loop_control:
-        label: "{{ item.item.nom }}"
-      tags: [latest]
-
-    - name: "latest — ce que l'inventaire devrait declarer"
-      ansible.builtin.debug:
-        msg: >-
-          {{ item.nom }} :
-          {{ 'deja au dernier (' ~ _tag ~ ')'
-             if _tag == (item.voulue.split(':') | last)
-             else (item.voulue.split(':') | last) ~ ' -> ' ~ _tag }}
-      vars:
-        _tag: "{{ _dernier[item.nom] | default('(aucun tag immuable publie)', true) }}"
-      loop: "{{ _table | default([]) }}"
-      loop_control:
-        label: "{{ item.nom }}"
-      tags: [latest]
-
-    # Ecriture sur demande seulement : le changement doit se relire en
-    # `git diff` avant d'atteindre le routeur.
-    - name: "latest — porter l'inventaire au dernier tag"
-      ansible.builtin.lineinfile:
-        path: "{{ _fichier }}"
-        regexp: "^(\\s+){{ item.nom }}:\\s*\\S+\\s*$"
-        line: "\\g<1>{{ item.nom }}: {{ item.voulue | regex_replace(':[^:]+$', '') }}:{{ _dernier[item.nom] }}"
-        backrefs: true
-      vars:
-        _fichier: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/main.yaml"
-      loop: "{{ _table | default([]) }}"
-      loop_control:
-        label: "{{ item.nom }}"
-      when:
-        - write_inventory | default(false) | bool
-        - (_dernier[item.nom] | default('')) | length > 0
-        - _dernier[item.nom] != (item.voulue.split(':') | last)
-      delegate_to: localhost
-      tags: [latest]
-
-    - name: "latest — relire le diff avant de committer"
-      ansible.builtin.debug:
-        msg: >-
-          Inventaire porte au dernier tag. Relisez avant de committer :
-          git diff -- {{ inventory_dir }}/host_vars/{{ inventory_hostname }}/main.yaml
-          puis relancez avec --tags apply.
-      when: write_inventory | default(false) | bool
-      tags: [latest]
 
     # --- check ---------------------------------------------------------
 
@@ -461,3 +363,141 @@
         - not ansible_check_mode
         - (_sessions_restantes.stdout | default('0') | trim | int) > 0
       tags: [apply]
+
+    # --- prune ---------------------------------------------------------
+    # Supprime les images qu'aucun conteneur n'utilise. Phase GLOBALE : elle
+    # porte sur toutes les images du routeur, pas sur le tableau. Un nom de
+    # service ne la restreint pas, et un conteneur absent de l'inventaire
+    # (declare a la main dans la configuration) protege quand meme son image.
+    #
+    # Taguee `never` : elle ne tourne que demandee (`--tags prune`), jamais dans
+    # un run sans tag. Supprimer l'image precedente, c'est renoncer a revenir en
+    # arriere sans retelecharger ; ca se decide, ca ne vient pas en passant.
+    #
+    # Une image est GARDEE des que l'une de ces conditions tient :
+    #   - un conteneur existe dessus (champ `containers` de podman, conteneurs
+    #     arretes compris) ;
+    #   - une ligne `image` de la configuration la designe. Cette configuration
+    #     est relue ICI : apres un `apply` dans le meme run, la lecture du debut
+    #     du play designerait encore les anciennes images. Cette condition
+    #     couvre un conteneur declare mais absent a cet instant -- sans son
+    #     image, le prochain commit echouerait.
+    #
+    # Suppression par IDENTIFIANT, une image a la fois, par la commande op-mode,
+    # qui refuse d'elle-meme une image dont un conteneur tourne. Jamais
+    # `delete container image all`.
+    #
+    # `become: false` : l'op-mode n'a pas besoin de root, et un sudo sur le
+    # routeur est ce qui a deja casse le config tree (cf. apply).
+
+    - name: "prune — relire la configuration et les images"
+      become: false
+      ansible.builtin.command:
+        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper {{ item }}"
+      loop:
+        - show configuration commands
+        - show container image json
+      register: _prune_lecture
+      changed_when: false
+      check_mode: false
+      tags: [prune, never]
+
+    # Une reference sans tag designe `:latest`. Une image correspond a une
+    # reference si l'un de ses noms (ou digests) lui est egal, ou s'y termine
+    # apres un « / » : un nom court de la configuration (`haproxy:3`) est
+    # complete par podman (`dhi.io/haproxy:3`).
+    #
+    # Les boucles Jinja rendent du TEXTE, pas une liste : d'ou le passage
+    # explicite par JSON (`to_json` dans le modele, `from_json` a l'usage).
+    - name: "prune — choisir les images a supprimer"
+      ansible.builtin.set_fact:
+        _prune_references: "{{ _references }}"
+        _prune_images: "{{ _images }}"
+        _a_purger: "{{ _choix | from_json }}"
+      vars:
+        _choix: >-
+          {% set out = [] %}
+          {% for img in _images %}
+          {%   set noms = (img.names | default([], true)) + (img.repo_digests | default([], true)) %}
+          {%   set ns = namespace(designee=false) %}
+          {%   for r in _references %}{% for n in noms %}
+          {%     if n == r or n.endswith('/' ~ r) %}{% set ns.designee = true %}{% endif %}
+          {%   endfor %}{% endfor %}
+          {%   if not ns.designee and (img.containers | default(0) | int) == 0 %}
+          {%     set _ = out.append({'id': img.id, 'noms': img.names | default([], true), 'taille': img.size | default(0)}) %}
+          {%   endif %}
+          {% endfor %}
+          {{ out | to_json }}
+        _images: "{{ _prune_lecture.results[1].stdout | from_json }}"
+        # Aucun antislash dans ces expressions : `\\S+` dans un bloc YAML ne
+        # correspondait a rien, la liste sortait VIDE et toute image sans
+        # conteneur devenait supprimable -- vu au banc, pas en production.
+        _toutes: >-
+          {{ _prune_lecture.results[0].stdout
+             | regex_findall("set container name [^ ]+ image '([^']+)'") }}
+        _references: >-
+          {{ (_toutes | select('search', ':[^/]+$|@') | list)
+             + (_toutes | reject('search', ':[^/]+$|@') | map('regex_replace', '$', ':latest') | list) }}
+      tags: [prune, never]
+
+    - name: "prune — ce qui sera supprime"
+      ansible.builtin.debug:
+        msg: >-
+          {{ _a_purger | length }} image(s) sans conteneur ni reference sur
+          {{ _prune_images | length }}
+          ({{ ((_a_purger | map(attribute='taille') | sum) / 1000000) | round | int }} Mo)
+          {%- for i in _a_purger %}{{ ' : ' if loop.first else ', ' }}{{ (i.noms | join(' ')) or '<sans nom>' }} ({{ i.id[:12] }}){% endfor %}
+      tags: [prune, never]
+
+    - name: "prune — supprimer"
+      become: false
+      ansible.builtin.command:
+        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper delete container image {{ item.id }}"
+      loop: "{{ _a_purger }}"
+      loop_control:
+        label: "{{ (item.noms | join(' ')) or item.id[:12] }}"
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [prune, never]
+
+    # Le controle qui compte : pas « les conteneurs tournent encore » -- un
+    # conteneur survit a la disparition de son image, et l'absence ne se paie
+    # qu'au prochain commit ou `restart container`. On verifie que chaque
+    # image designee par la configuration est toujours la.
+    - name: "prune — relire les images"
+      become: false
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show container image json
+      register: _prune_apres
+      changed_when: false
+      when:
+        - not ansible_check_mode
+        - _a_purger | length > 0
+      tags: [prune, never]
+
+    - name: "prune — chaque image de la configuration est toujours la"
+      ansible.builtin.assert:
+        that: (_absentes | from_json) | length == 0
+        fail_msg: >-
+          Images designees par la configuration mais absentes du routeur :
+          {{ _absentes | from_json | join(', ') }}. Le prochain commit ou `restart container`
+          echouera : `add container image <reference>` pour chacune.
+        success_msg: "{{ _prune_references | length }} reference(s) de la configuration toujours presentes"
+        quiet: true
+      vars:
+        _noms: >-
+          {{ (_prune_apres.stdout | from_json | map(attribute='names') | select | flatten)
+             + (_prune_apres.stdout | from_json | map(attribute='repo_digests') | select | flatten) }}
+        _absentes: >-
+          {% set out = [] %}
+          {% for r in _prune_references %}
+          {%   if _noms | select('equalto', r) | list | length == 0
+                  and _noms | select('search', '/' ~ (r | regex_escape) ~ '$') | list | length == 0 %}
+          {%     set _ = out.append(r) %}
+          {%   endif %}
+          {% endfor %}
+          {{ out | to_json }}
+      when:
+        - not ansible_check_mode
+        - _a_purger | length > 0
+      tags: [prune, never]
