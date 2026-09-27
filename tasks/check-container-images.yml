@@ -80,8 +80,8 @@
           _running_container_images[item] == _images_attendues[item]
           or (
             (vyos_container_images_ignore_build_revision | default(false) | bool)
-            and (_running_container_images[item] | regex_replace('\\.[0-9]+$', ''))
-                == (_images_attendues[item] | regex_replace('\\.[0-9]+$', ''))
+            and (_running_container_images[item] | regex_replace('[.][0-9]+$', ''))
+                == (_images_attendues[item] | regex_replace('[.][0-9]+$', ''))
           )
         )
     fail_msg: >-
