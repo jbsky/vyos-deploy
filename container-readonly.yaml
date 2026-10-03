@@ -1,0 +1,329 @@
+---
+# ansible-playbook container-readonly.yaml -i <ton-inventaire> --tags <phase>
+#
+# Fait tourner les conteneurs du routeur avec un rootfs en LECTURE SEULE.
+#
+# ---------------------------------------------------------------------
+#  Pourquoi un reglage global
+# ---------------------------------------------------------------------
+#
+# La CLI VyOS n'a aucune option read-only par conteneur (`container.py` ne
+# sait poser que `tmpfs`, `volume`, etc.). Podman, lui, lit `read_only = true`
+# dans `[containers]` de containers.conf. `/etc/containers/containers.conf`
+# est REGENERE par VyOS a chaque commit : on depose donc un fichier a cote,
+# dans `containers.conf.d/`, que VyOS ne touche pas.
+#
+# Consequence a garder en tete : une fois ce fichier pose, TOUT conteneur qui
+# (re)demarre -- reboot, commit, `restart container`, `restart on-failure` --
+# revient en lecture seule. La bascule n'est pas progressive ; seul l'ordre
+# des redemarrages l'est. D'ou les phases ci-dessous, dans cet ordre.
+#
+# `read_only_tmpfs` (vrai par defaut) monte des tmpfs 1777 sur /run, /tmp,
+# /var/tmp et /dev/shm. Ils MASQUENT ce que l'image avait prepare dessous
+# (un /run/<service> possede par l'utilisateur du service, par exemple) :
+# ces repertoires-la se redeclarent en `tmpfs` VyOS (1777 aussi), conteneur
+# par conteneur, dans l'inventaire.
+#
+# Un conteneur de maintenance qui doit ecrire dans son image (renommer un
+# binaire...) passe `--read-only=false` explicitement.
+#
+# ---------------------------------------------------------------------
+#  Le tableau
+# ---------------------------------------------------------------------
+#
+#   vyos_container_readonly:
+#     - name: clamav                    # ordre de la liste = ordre des
+#       tmpfs:                          # redemarrages a la bascule : du
+#         - name: run                   # moins risque au plus risque
+#           destination: /run/clamav
+#           size: 1                     # Mo, obligatoire cote VyOS
+#     - name: c-icap
+#       volumes:                        # ecritures volumineuses : disque,
+#         - name: spool                 # pas tmpfs (un tmpfs compte dans la
+#           destination: /tmp           # limite memoire du conteneur)
+#           source: /config/containers/c-icap-spool
+#           owner: 4100
+#           group: 4100
+#     - name: suricata                  # rien a declarer : redemarrage seul
+#
+# ---------------------------------------------------------------------
+#  Les phases
+# ---------------------------------------------------------------------
+#
+#   --tags check     etat de chaque conteneur (ReadonlyRootfs) et du reglage
+#   --tags prepare   cree les repertoires des volumes, pose les noeuds tmpfs
+#                    et volume (un commit PAR conteneur), redemarre par
+#                    systemd. Rootfs encore inscriptible : un tmpfs par-dessus
+#                    est sans effet sur le service.
+#   --tags enable    pose le reglage global (+ sa recreation au boot dans
+#                    vyos-preconfig-bootup.script, pour survivre a une montee
+#                    d'image systeme), puis redemarre UN conteneur a la fois,
+#                    dans l'ordre du tableau, et s'arrete au premier qui ne
+#                    tient pas.
+#   --tags rollback  retire le reglage et redemarre. Jamais compris dans
+#                    « tout » : il faut le demander.
+#
+# `-e vyos_container_readonly_only=<nom>` restreint prepare/enable/rollback a
+# un conteneur (le reglage global reste global : il est pose quand meme).
+#
+# A LANCER PAR LA CHAINE CI, jamais a la main : ce playbook redemarre le DNS
+# et le proxy.
+
+- name: Read-only rootfs for VyOS containers
+  hosts: vyos
+  gather_facts: false
+
+  vars:
+    _dropin_dir: /etc/containers/containers.conf.d
+    _dropin: /etc/containers/containers.conf.d/50-read-only.conf
+    _preconfig: /config/scripts/vyos-preconfig-bootup.script
+    _only: "{{ vyos_container_readonly_only | default('') }}"
+    _cibles: >-
+      {{ vyos_container_readonly | default([])
+         | selectattr('name', 'in', ([_only] if _only else (vyos_container_readonly | default([]) | map(attribute='name') | list)))
+         | list }}
+
+  tasks:
+
+    - name: Refuser un nom inconnu
+      ansible.builtin.assert:
+        that: _cibles | length > 0
+        fail_msg: >-
+          Aucun conteneur retenu (vyos_container_readonly vide, ou
+          « {{ _only }} » n'y figure pas).
+        quiet: true
+      tags: always
+
+    # --- check ---------------------------------------------------------
+
+    - name: "check — reglage global present ?"
+      ansible.builtin.stat:
+        path: "{{ _dropin }}"
+      register: _dropin_stat
+      tags: [check, enable, rollback]
+
+    - name: "check — etat des conteneurs"
+      ansible.builtin.command:
+        cmd: >-
+          podman inspect {{ item.name }}
+          --format '{{ '{{' }}.State.Status{{ '}}' }} ro={{ '{{' }}.HostConfig.ReadonlyRootfs{{ '}}' }}'
+      loop: "{{ _cibles }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _etat
+      changed_when: false
+      failed_when: false
+      tags: [check]
+
+    - name: "check — rapport"
+      ansible.builtin.debug:
+        msg: >-
+          reglage global {{ 'POSE' if _dropin_stat.stat.exists else 'absent' }} ;
+          {% for r in _etat.results %}{{ r.item.name }}: {{ (r.stdout | default('') | trim) or r.stderr | default('?') | trim }}{{ ' ; ' if not loop.last }}{% endfor %}
+      tags: [check]
+
+    # --- garde commune aux phases qui ecrivent -------------------------
+    # Un commit VyOS lance pendant qu'un autre tourne laisse le routeur dans
+    # un etat qu'on ne repare qu'en le redemarrant (vecu le 2026-10-02).
+
+    - name: Aucun commit VyOS en cours
+      ansible.builtin.command:
+        cmd: pgrep -f my_commit
+      register: _commit_en_cours
+      changed_when: false
+      failed_when: _commit_en_cours.rc == 0
+      tags: [prepare, enable, rollback]
+
+    # --- prepare -------------------------------------------------------
+
+    - name: "prepare — repertoires des volumes"
+      ansible.builtin.file:
+        path: "{{ item.1.source }}"
+        state: directory
+        owner: "{{ item.1.owner | default(omit) }}"
+        group: "{{ item.1.group | default(omit) }}"
+        mode: "{{ item.1.mode | default('0700') }}"
+      loop: "{{ _cibles | subelements('volumes', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.name }}:{{ item.1.destination }}"
+      tags: [prepare]
+
+    - name: "prepare — relire la configuration"
+      become: false
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+      register: _cfg
+      changed_when: false
+      tags: [prepare]
+
+    # Les lignes `set` attendues, conteneur par conteneur ; seules celles que
+    # la configuration ne montre pas encore sont posees.
+    - name: "prepare — calculer les lignes manquantes"
+      ansible.builtin.set_fact:
+        _a_poser: "{{ _plan | from_json }}"
+      vars:
+        _plan: >-
+          {% set out = [] %}
+          {% for c in _cibles %}
+          {%   set lignes = [] %}
+          {%   for t in c.tmpfs | default([]) %}
+          {%     set _ = lignes.append("set container name " ~ c.name ~ " tmpfs " ~ t.name ~ " destination '" ~ t.destination ~ "'") %}
+          {%     set _ = lignes.append("set container name " ~ c.name ~ " tmpfs " ~ t.name ~ " size '" ~ (t.size | default(1)) ~ "'") %}
+          {%   endfor %}
+          {%   for v in c.volumes | default([]) %}
+          {%     set _ = lignes.append("set container name " ~ c.name ~ " volume " ~ v.name ~ " destination '" ~ v.destination ~ "'") %}
+          {%     set _ = lignes.append("set container name " ~ c.name ~ " volume " ~ v.name ~ " source '" ~ v.source ~ "'") %}
+          {%   endfor %}
+          {%   set manquantes = lignes | reject('in', _cfg.stdout_lines) | list %}
+          {%   if manquantes %}{% set _ = out.append({'name': c.name, 'lignes': manquantes}) %}{% endif %}
+          {% endfor %}
+          {{ out | to_json }}
+      tags: [prepare]
+
+    - name: "prepare — rien a poser"
+      ansible.builtin.debug:
+        msg: Tous les noeuds tmpfs/volume sont deja dans la configuration.
+      when: _a_poser | length == 0
+      tags: [prepare]
+
+    # Un commit par conteneur : un echec n'emporte que lui. Memes quatre
+    # details que l'apply d'image-update.yaml (source qui sort en 1, `sg
+    # vyattacfg`, `end` qui ne decide pas du sort de la tache, become: false
+    # -- un commit joue en root casse le config tree). Le wrapper est muet
+    # quand il reussit : la preuve est la relecture qui suit.
+    - name: "prepare — poser les noeuds, commit et save"
+      become: false
+      ansible.builtin.shell:
+        cmd: |
+          sg vyattacfg -c '
+          set -e
+          source /etc/default/vyatta || true
+          W=/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper
+          $W begin
+          {% for l in item.lignes %}
+          $W {{ l | replace("'", "") }}
+          {% endfor %}
+          $W commit
+          $W save
+          $W end || echo "AVERTISSEMENT: teardownSession a rendu $?" >&2
+          '
+        executable: /bin/bash
+      loop: "{{ _a_poser }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [prepare]
+
+    - name: "prepare — relire apres commit"
+      become: false
+      ansible.builtin.command:
+        cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands
+      register: _cfg_apres
+      changed_when: false
+      when:
+        - _a_poser | length > 0
+        - not ansible_check_mode
+      tags: [prepare]
+
+    - name: "prepare — verifier que chaque ligne est en place"
+      ansible.builtin.assert:
+        that: item.lignes | reject('in', _cfg_apres.stdout_lines) | list | length == 0
+        fail_msg: >-
+          {{ item.name }} : lignes absentes apres commit :
+          {{ item.lignes | reject('in', _cfg_apres.stdout_lines) | list }}
+        quiet: true
+      loop: "{{ _a_poser }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - _a_poser | length > 0
+        - not ansible_check_mode
+      tags: [prepare]
+
+    # Le commit recree le conteneur HORS du chemin systemd (cf. image-update :
+    # pour squid, les regles nft REDIRECT disparaissent). Repasser par l'unite.
+    - name: "prepare — redemarrer par systemd"
+      become: false
+      ansible.builtin.command:
+        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper restart container {{ item.name }}"
+      loop: "{{ _a_poser }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [prepare]
+
+    # --- enable --------------------------------------------------------
+
+    - name: "enable — repertoire des drop-in"
+      ansible.builtin.file:
+        path: "{{ _dropin_dir }}"
+        state: directory
+        mode: "0755"
+      tags: [enable]
+
+    - name: "enable — reglage global"
+      ansible.builtin.copy:
+        dest: "{{ _dropin }}"
+        mode: "0644"
+        content: |
+          # Gere par container-readonly.yaml (vyos-deploy). Rootfs en lecture
+          # seule pour TOUS les conteneurs ; un conteneur de maintenance qui
+          # doit ecrire dans son image passe --read-only=false.
+          [containers]
+          read_only = true
+      tags: [enable]
+
+    # /etc appartient a l'image systeme : une montee d'image VyOS perd le
+    # fichier. Le script de pre-configuration (dans /config, conserve) le
+    # recree a chaque boot, AVANT que la configuration ne lance les conteneurs.
+    - name: "enable — recreer le reglage au boot"
+      ansible.builtin.blockinfile:
+        path: "{{ _preconfig }}"
+        marker: "# {mark} container-readonly (vyos-deploy)"
+        block: |
+          mkdir -p {{ _dropin_dir }}
+          printf '[containers]\nread_only = true\n' > {{ _dropin }}
+      tags: [enable]
+
+    - name: "enable — redemarrer et verifier, un conteneur a la fois"
+      ansible.builtin.include_tasks:
+        file: tasks/readonly-restart-verify.yml
+        apply:
+          tags: [enable]
+      loop: "{{ _cibles }}"
+      loop_control:
+        loop_var: _c
+        label: "{{ _c.name }}"
+      vars:
+        _ro_attendu: true
+      tags: [enable]
+
+    # --- rollback ------------------------------------------------------
+
+    - name: "rollback — retirer le reglage global"
+      ansible.builtin.file:
+        path: "{{ _dropin }}"
+        state: absent
+      tags: [rollback, never]
+
+    - name: "rollback — retirer sa recreation au boot"
+      ansible.builtin.blockinfile:
+        path: "{{ _preconfig }}"
+        marker: "# {mark} container-readonly (vyos-deploy)"
+        state: absent
+      tags: [rollback, never]
+
+    - name: "rollback — redemarrer et verifier"
+      ansible.builtin.include_tasks:
+        file: tasks/readonly-restart-verify.yml
+        apply:
+          tags: [rollback]
+      loop: "{{ _cibles }}"
+      loop_control:
+        loop_var: _c
+        label: "{{ _c.name }}"
+      vars:
+        _ro_attendu: false
+      tags: [rollback, never]

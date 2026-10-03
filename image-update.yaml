@@ -5,9 +5,11 @@
 # leurs tags dans la configuration du routeur, et supprime sur demande les
 # images qu'aucun conteneur n'utilise plus.
 #
-# C'est le SEUL playbook de ce depot qui modifie `config.boot`. Les autres
-# (`<service>-deploy.yaml`) deploient des fichiers de configuration et se
-# contentent de CONSTATER une derive d'image, en lecture seule. La separation
+# C'est le SEUL playbook de ce depot qui modifie les IMAGES dans
+# `config.boot` (`container-readonly.yaml` y pose des tmpfs et des volumes,
+# jamais une image). Les `<service>-deploy.yaml` deploient des fichiers de
+# configuration et se contentent de CONSTATER une derive d'image, en lecture
+# seule. La separation
 # est deliberee : deployer une conf ne doit jamais changer une version
 # d'image en passant.
 #

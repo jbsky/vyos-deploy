@@ -1,0 +1,50 @@
+---
+# Redemarre UN conteneur par son unite systemd et verifie qu'il tient.
+# Appele en boucle par container-readonly.yaml (loop_var: _c) ; un echec
+# arrete le play, donc les conteneurs suivants ne sont pas touches.
+#
+# « Tient » = en marche, ReadonlyRootfs conforme, et MEME date de demarrage a
+# 20 s d'intervalle : un conteneur qui plante est relance par
+# `restart on-failure`, et une seule lecture le verrait « running ».
+
+- name: "{{ _c.name }} — redemarrer par systemd"
+  become: false
+  ansible.builtin.command:
+    cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper restart container {{ _c.name }}"
+  changed_when: true
+
+- name: "{{ _c.name }} — attendre qu'il tourne"
+  ansible.builtin.command:
+    cmd: >-
+      podman inspect {{ _c.name }}
+      --format '{{ '{{' }}.State.Status{{ '}}' }}|{{ '{{' }}.HostConfig.ReadonlyRootfs{{ '}}' }}|{{ '{{' }}.State.StartedAt{{ '}}' }}'
+  register: _r1
+  until: _r1.rc == 0 and _r1.stdout.split('|')[0] == 'running'
+  retries: 12
+  delay: 5
+  changed_when: false
+
+- name: "{{ _c.name }} — laisser passer l'init"
+  ansible.builtin.pause:
+    seconds: "{{ _c.settle | default(20) }}"
+
+- name: "{{ _c.name }} — relire"
+  ansible.builtin.command:
+    cmd: >-
+      podman inspect {{ _c.name }}
+      --format '{{ '{{' }}.State.Status{{ '}}' }}|{{ '{{' }}.HostConfig.ReadonlyRootfs{{ '}}' }}|{{ '{{' }}.State.StartedAt{{ '}}' }}'
+  register: _r2
+  changed_when: false
+
+- name: "{{ _c.name }} — verifier"
+  ansible.builtin.assert:
+    that:
+      - _r2.stdout.split('|')[0] == 'running'
+      - _r2.stdout.split('|')[1] == (_ro_attendu | string | lower)
+      - _r2.stdout.split('|')[2] == _r1.stdout.split('|')[2]
+    fail_msg: >-
+      {{ _c.name }} ne tient pas : avant « {{ _r1.stdout }} », apres
+      « {{ _r2.stdout }} » (attendu running, ReadonlyRootfs={{ _ro_attendu | string | lower }},
+      date de demarrage inchangee). Journal : `show container log {{ _c.name }}`.
+      Retour arriere : --tags rollback.
+    success_msg: "{{ _c.name }} : running, ReadonlyRootfs={{ _r2.stdout.split('|')[1] }}"
