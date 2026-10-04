@@ -40,9 +40,9 @@
 #
 #   --tags check    constate la derive, ne touche a rien
 #   --tags pull     telecharge les images seulement
-#   --tags apply    pose les tags (et les tmpfs/volumes de la lecture seule),
-#                   commit, save, verifie, redemarre un conteneur a la fois,
-#                   lance les apres-montees
+#   --tags apply    lance les avant-montees, pose les tags (et les
+#                   tmpfs/volumes de la lecture seule), commit, save, verifie,
+#                   redemarre un conteneur a la fois, lance les apres-montees
 #   --tags prune    supprime les images qu'aucun conteneur n'utilise. Jamais
 #                   comprise dans « tout » : il faut la demander.
 #
@@ -102,6 +102,10 @@
     _post_update: >-
       {{ _a_changer
          | selectattr('nom', 'in', (vyos_container_post_update | default({}) | list))
+         | list }}
+    _pre_update: >-
+      {{ _a_changer
+         | selectattr('nom', 'in', (vyos_container_pre_update | default({}) | list))
          | list }}
 
     # Lecture seule (bloc « lecture seule » plus bas).
@@ -376,6 +380,36 @@
     #    au wrapper tout ce qu'il exige, et c'est la forme exacte d'un commit
     #    interactif. Ne pas rendre l'hote entier `become: false` pour autant --
     #    les taches qui deposent des fichiers de conf, elles, en ont besoin.
+
+    # Avant-montee propre a un service : meme forme que l'apres-montee
+    # (`vyos_container_pre_update`, src/dest/owner/group/mode), jouee AVANT le
+    # commit qui change l'image, pour les seuls services dont l'image change.
+    # Cas d'ecole : une application dont les migrations de base sont sans
+    # retour -- sauvegarder et relire la base avant de monter. Une sortie non
+    # nulle arrete le run ICI : aucune image n'a encore change.
+    - name: "apply — deposer les scripts d'avant-montee"
+      ansible.builtin.copy:
+        src: "{{ vyos_container_pre_update[item.nom].src }}"
+        dest: "{{ vyos_container_pre_update[item.nom].dest }}"
+        owner: "{{ vyos_container_pre_update[item.nom].owner | default(omit) }}"
+        group: "{{ vyos_container_pre_update[item.nom].group | default(omit) }}"
+        mode: "{{ vyos_container_pre_update[item.nom].mode | default('0755') }}"
+      loop: "{{ _pre_update }}"
+      loop_control:
+        label: "{{ item.nom }} : {{ vyos_container_pre_update[item.nom].dest }}"
+      when: not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — lancer les scripts d'avant-montee"
+      become: false
+      ansible.builtin.command:
+        cmd: "{{ vyos_container_pre_update[item.nom].dest }}"
+      loop: "{{ _pre_update }}"
+      loop_control:
+        label: "{{ item.nom }}"
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [apply]
 
     - name: "apply — lecture seule : repertoires des volumes"
       ansible.builtin.file:
