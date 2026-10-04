@@ -22,6 +22,8 @@
 #   logrotate → rotation des journaux (remplace celle du paquet de l'image
 #               VyOS, cassee en conteneur), conservee dans /config et
 #               reinstallee a chaque boot
+#   rsyslog  → transmission d'eve.json et fast.log au syslog (donc au collecteur
+#               distant), conservee dans /config et reinstallee a chaque boot
 #
 # Exemples :
 #   ansible-playbook suricata-deploy.yaml
@@ -170,7 +172,59 @@
       when: _logrotate_src.stat.exists
       tags: [logrotate]
 
+    # ── Transmission des journaux (rsyslog) ────────────────────────
+    # Le fichier vivait seulement dans /etc : une montee d'image VyOS le
+    # perdait, et plus aucun evenement Suricata n'aurait quitte le routeur,
+    # sans erreur. Meme schema que logrotate : /etc + copie dans /config
+    # reinstallee au boot (puis rsyslog relance, il est deja demarre).
+    - name: rsyslog — source presente ?
+      ansible.builtin.stat:
+        path: "{{ suricata_conf }}/rsyslog.conf"
+      delegate_to: localhost
+      become: false
+      register: _rsyslog_src
+      tags: [rsyslog]
+
+    - name: rsyslog — conserver dans /config
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/rsyslog.conf"
+        dest: /config/etc/rsyslog/10-suricata.conf
+        owner: root
+        group: root
+        mode: "0644"
+      when: _rsyslog_src.stat.exists
+      tags: [rsyslog]
+
+    - name: rsyslog — installer
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/rsyslog.conf"
+        dest: /etc/rsyslog.d/10-suricata.conf
+        owner: root
+        group: root
+        mode: "0644"
+      when: _rsyslog_src.stat.exists
+      notify: Restart rsyslog
+      tags: [rsyslog]
+
+    - name: rsyslog — reinstaller a chaque boot
+      ansible.builtin.blockinfile:
+        path: /config/scripts/vyos-postconfig-bootup.script
+        marker: "# {mark} suricata rsyslog (vyos-deploy)"
+        block: |
+          if [ -f /config/etc/rsyslog/10-suricata.conf ]; then
+            install -m 0644 -o root -g root /config/etc/rsyslog/10-suricata.conf /etc/rsyslog.d/10-suricata.conf
+            systemctl restart rsyslog
+          fi
+      when: _rsyslog_src.stat.exists
+      tags: [rsyslog]
+
   handlers:
+    - name: Restart rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+      listen: Restart rsyslog
+
     - name: Restart suricata
       ansible.builtin.command:
         cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper restart container suricata
