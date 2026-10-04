@@ -14,6 +14,7 @@
 #   config   → copier haproxy.cfg + WWW.crt_list sur VyOS
 #   service  → redemarrer le container haproxy
 #   check    → verifier que HAProxy repond
+#   cert_perms → resserrer les droits des cles TLS (haproxy_cert_restrict)
 #
 # Exemples :
 #   ansible-playbook haproxy-deploy.yaml
@@ -75,6 +76,64 @@
           cert (Let's Encrypt DNS-01 par exemple) puis synchronise le PEM
           dans le dossier WWW/ avant de recharger.
       tags: [config]
+
+    # ── Droits des cles TLS ─────────────────────────────────────────
+    # Optionnel (inventaire) :
+    #   haproxy_cert_restrict:
+    #     paths: [/config/containers/haproxy/WWW, /config/containers/haproxy/certs]
+    #     mode: "0640"
+    #     owner: keycloak   # l'utilisateur qui SYNCHRONISE les cles : en 0640 le
+    #                       # groupe n'ecrit plus, seul le proprietaire peut les
+    #                       # ecraser au renouvellement (sinon synchro cassee)
+    #     group: 102        # groupe des cles = gid du processus haproxy
+    # Les cles, synchronisees en 0664, sont lisibles par tout compte du
+    # routeur. En 0640, seuls le proprietaire et le GROUPE lisent : le
+    # processus haproxy doit donc avoir ce groupe (uid/gid du conteneur, pose
+    # par image-update). GARDE : on refuse tant que ce n'est pas le cas --
+    # resserrer d'abord rendrait les cles illisibles au prochain rechargement,
+    # et le site tomberait. Aucun redemarrage : le contenu ne change pas.
+    - name: Cles TLS — utilisateur du conteneur en service
+      ansible.builtin.command:
+        cmd: podman inspect haproxy --format '{{ '{{' }}.Config.User{{ '}}' }}'
+      register: _haproxy_user
+      changed_when: false
+      when: haproxy_cert_restrict is defined
+      tags: [config, cert_perms]
+
+    - name: Cles TLS — le conteneur doit deja avoir le groupe des cles
+      ansible.builtin.assert:
+        that:
+          - (_haproxy_user.stdout | trim) is search(':')
+          - (_haproxy_user.stdout | trim).split(':') | last == (haproxy_cert_restrict.group | string)
+        fail_msg: >-
+          haproxy tourne en « {{ _haproxy_user.stdout | trim }} » : son groupe
+          n'est pas {{ haproxy_cert_restrict.group }}. Passer d'abord le
+          conteneur en gid {{ haproxy_cert_restrict.group }} (vyos-image-update),
+          sinon les cles en {{ haproxy_cert_restrict.mode }} deviendraient
+          illisibles pour lui.
+        quiet: true
+      when: haproxy_cert_restrict is defined
+      tags: [config, cert_perms]
+
+    - name: Cles TLS — lister
+      ansible.builtin.find:
+        paths: "{{ haproxy_cert_restrict.paths }}"
+        patterns: ["*.pem", "*.cert", "*.key", "*.bak"]
+      register: _haproxy_keys
+      when: haproxy_cert_restrict is defined
+      tags: [config, cert_perms]
+
+    - name: Cles TLS — resserrer
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "{{ haproxy_cert_restrict.mode }}"
+        owner: "{{ haproxy_cert_restrict.owner | default(omit) }}"
+        group: "{{ haproxy_cert_restrict.group }}"
+      loop: "{{ _haproxy_keys.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: haproxy_cert_restrict is defined
+      tags: [config, cert_perms]
 
   handlers:
     - name: Restart haproxy

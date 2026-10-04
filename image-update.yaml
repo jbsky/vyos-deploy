@@ -255,6 +255,9 @@
     #            source: /config/containers/c-icap-spool,
     #            owner: 4100, group: 4100, mode: "0700"}
     #     - name: suricata                  # rien a declarer
+    #     - name: haproxy                   # identite du processus (VyOS
+    #       uid: 4430                       # n'applique gid qu'avec uid) :
+    #       gid: 102                        # lire des cles 0640 de ce groupe
     #
     # Pourquoi un reglage GLOBAL : la CLI VyOS n'a aucune option read-only par
     # conteneur ; podman lit `read_only = true` dans containers.conf.d/, que
@@ -312,6 +315,12 @@
         _plan: >-
           {% set out = [] %}
           {% for c in _ro_table %}
+          {%   if c.uid is defined %}
+          {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " uid '" ~ c.uid ~ "'"}) %}
+          {%   endif %}
+          {%   if c.gid is defined %}
+          {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " gid '" ~ c.gid ~ "'"}) %}
+          {%   endif %}
           {%   for t in c.tmpfs | default([]) %}
           {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " tmpfs " ~ t.name ~ " destination '" ~ t.destination ~ "'"}) %}
           {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " tmpfs " ~ t.name ~ " size '" ~ (t.size | default(1)) ~ "'"}) %}
