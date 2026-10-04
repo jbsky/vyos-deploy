@@ -19,8 +19,8 @@ Chaque service a son propre playbook autonome à la racine
 | `suricata-deploy.yaml` | Suricata IPS inline (NFQUEUE) + mise à jour des règles |
 | `bind-deploy.yaml` | BIND9 (zones, split-horizon, TSIG pour ACME DNS-01) |
 | `haproxy-deploy.yaml` | HAProxy (reverse-proxy TLS vers Traefik/K3s) |
-| `image-update.yaml` | Aligne les **images** des conteneurs sur l'inventaire (seul playbook qui change une image dans `config.boot`) |
-| `container-readonly.yaml` | Rootfs en **lecture seule** pour tous les conteneurs (réglage podman global + tmpfs/volumes déclarés par conteneur, bascule un conteneur à la fois) |
+| `image-update.yaml` | Aligne les **images** des conteneurs sur l'inventaire, pose le rootfs en **lecture seule** et lance les après-montées (seul playbook qui modifie `config.boot`) |
+| `container-readonly.yaml` | Constat et retour arrière d'urgence du rootfs en **lecture seule** (la mise en place est dans `image-update.yaml`, pilotée par `vyos_container_readonly_enabled`) |
 
 ## Ce repo ne fournit aucun inventaire
 

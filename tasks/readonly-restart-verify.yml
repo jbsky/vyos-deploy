@@ -1,7 +1,8 @@
 ---
 # Redemarre UN conteneur par son unite systemd et verifie qu'il tient.
-# Appele en boucle par container-readonly.yaml (loop_var: _c) ; un echec
-# arrete le play, donc les conteneurs suivants ne sont pas touches.
+# Appele en boucle par image-update.yaml (apply) et container-readonly.yaml
+# (rollback), loop_var: _c ; un echec arrete le play, donc les conteneurs
+# suivants ne sont pas touches.
 #
 # « Tient » = en marche, ReadonlyRootfs conforme, et MEME date de demarrage a
 # 20 s d'intervalle : un conteneur qui plante est relance par
@@ -46,5 +47,6 @@
       {{ _c.name }} ne tient pas : avant « {{ _r1.stdout }} », apres
       « {{ _r2.stdout }} » (attendu running, ReadonlyRootfs={{ _ro_attendu | string | lower }},
       date de demarrage inchangee). Journal : `show container log {{ _c.name }}`.
-      Retour arriere : --tags rollback.
+      Retour arriere : container-readonly.yaml --tags rollback (urgence),
+      puis vyos_container_readonly_enabled: false (durable).
     success_msg: "{{ _c.name }} : running, ReadonlyRootfs={{ _r2.stdout.split('|')[1] }}"

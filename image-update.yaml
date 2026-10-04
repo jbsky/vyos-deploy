@@ -5,9 +5,9 @@
 # leurs tags dans la configuration du routeur, et supprime sur demande les
 # images qu'aucun conteneur n'utilise plus.
 #
-# C'est le SEUL playbook de ce depot qui modifie les IMAGES dans
-# `config.boot` (`container-readonly.yaml` y pose des tmpfs et des volumes,
-# jamais une image). Les `<service>-deploy.yaml` deploient des fichiers de
+# C'est le SEUL playbook de ce depot qui modifie `config.boot` : les images,
+# et les tmpfs/volumes qu'exige le rootfs en lecture seule (bloc « lecture
+# seule » plus bas). Les `<service>-deploy.yaml` deploient des fichiers de
 # configuration et se contentent de CONSTATER une derive d'image, en lecture
 # seule. La separation
 # est deliberee : deployer une conf ne doit jamais changer une version
@@ -40,7 +40,9 @@
 #
 #   --tags check    constate la derive, ne touche a rien
 #   --tags pull     telecharge les images seulement
-#   --tags apply    pose les tags, commit, save, verifie, redemarre
+#   --tags apply    pose les tags (et les tmpfs/volumes de la lecture seule),
+#                   commit, save, verifie, redemarre un conteneur a la fois,
+#                   lance les apres-montees
 #   --tags prune    supprime les images qu'aucun conteneur n'utilise. Jamais
 #                   comprise dans « tout » : il faut la demander.
 #
@@ -101,6 +103,14 @@
       {{ _a_changer
          | selectattr('nom', 'in', (vyos_container_post_update | default({}) | list))
          | list }}
+
+    # Lecture seule (bloc « lecture seule » plus bas).
+    _ro_actif: "{{ vyos_container_readonly_enabled | default(false) | bool }}"
+    _ro_table: "{{ vyos_container_readonly | default([]) }}"
+    _ro_dropin_dir: /etc/containers/containers.conf.d
+    _ro_dropin: /etc/containers/containers.conf.d/50-read-only.conf
+    _ro_preconfig: /config/scripts/vyos-preconfig-bootup.script
+    _ro_marker: "# {mark} container-readonly (vyos-deploy)"
 
   tasks:
     - name: Fail early when the inventory declares nothing
@@ -226,6 +236,101 @@
           {{ '(sur ' ~ (_declares | length) ~ ' declarees)' if (_retenus | length) < (_declares | length) else '' }}.
       tags: [check, pull, apply]
 
+    # --- lecture seule -------------------------------------------------
+    # Rootfs en lecture seule pour TOUS les conteneurs du routeur, pilote par
+    # l'inventaire :
+    #
+    #   vyos_container_readonly_enabled: true
+    #   vyos_container_readonly:            # ordre = ordre des redemarrages
+    #     - name: clamav                    # a la bascule, du moins risque
+    #       tmpfs:                          # au plus risque
+    #         - {name: run, destination: /run/clamav, size: 1}
+    #     - name: c-icap
+    #       volumes:                        # ecritures volumineuses : disque
+    #         - {name: spool, destination: /tmp,
+    #            source: /config/containers/c-icap-spool,
+    #            owner: 4100, group: 4100, mode: "0700"}
+    #     - name: suricata                  # rien a declarer
+    #
+    # Pourquoi un reglage GLOBAL : la CLI VyOS n'a aucune option read-only par
+    # conteneur ; podman lit `read_only = true` dans containers.conf.d/, que
+    # VyOS ne regenere pas (containers.conf, lui, l'est a chaque commit).
+    # `read_only_tmpfs` (vrai par defaut) met des tmpfs 1777 sur /run, /tmp,
+    # /var/tmp, /dev/shm -- qui MASQUENT ce que l'image avait prepare dessous
+    # (un /run/<service> possede par le service) : d'ou les `tmpfs` declares.
+    #
+    # Consequences, voulues :
+    # - les tmpfs/volumes se posent pour TOUS les conteneurs du tableau, quel
+    #   que soit le filtre par service : une fois le reglage pose, n'importe
+    #   quel conteneur qui redemarre revient en lecture seule ;
+    # - un conteneur du routeur absent du tableau fait echouer le run (il
+    #   reviendrait en lecture seule sans ses tmpfs) ;
+    # - quand le reglage APPARAIT (ou disparait, `enabled: false` = retour
+    #   arriere durable), TOUS les conteneurs redemarrent, un a la fois, dans
+    #   l'ordre du tableau, et le run s'arrete au premier qui ne tient pas ;
+    # - le reglage est recree a chaque boot par le script de pre-configuration
+    #   (/etc appartient a l'image systeme, une montee d'image VyOS le perdrait).
+    #
+    # Un conteneur de maintenance qui ecrit dans son image passe
+    # `--read-only=false` explicitement.
+
+    - name: "lecture seule — conteneurs du routeur"
+      ansible.builtin.set_fact:
+        _ro_routeur: >-
+          {{ _cfg.stdout | regex_findall("set container name ([^ ]+) image ") | unique | list }}
+        _ro_noms_table: "{{ _ro_table | map(attribute='name') | list }}"
+      tags: [check, apply]
+
+    - name: "lecture seule — reglage pose ?"
+      ansible.builtin.stat:
+        path: "{{ _ro_dropin }}"
+      register: _ro_dropin_stat
+      tags: [check, apply]
+
+    - name: "lecture seule — chaque conteneur du routeur est dans le tableau"
+      ansible.builtin.assert:
+        that: _ro_routeur | difference(_ro_noms_table) | length == 0
+        fail_msg: >-
+          Conteneur(s) absent(s) de vyos_container_readonly :
+          {{ _ro_routeur | difference(_ro_noms_table) | join(', ') }}. Avec le
+          reglage global, ils reviendraient en lecture seule sans leurs tmpfs.
+          Les declarer (meme sans rien : `- name: <nom>`).
+        quiet: true
+      when: _ro_actif
+      tags: [check, apply]
+
+    # Les lignes `set` attendues ; seules celles que la configuration ne montre
+    # pas encore seront posees, dans le meme commit que les images.
+    - name: "lecture seule — lignes manquantes"
+      ansible.builtin.set_fact:
+        _ro_a_poser: "{{ (_plan | from_json) if _ro_actif else [] }}"
+      vars:
+        _plan: >-
+          {% set out = [] %}
+          {% for c in _ro_table %}
+          {%   for t in c.tmpfs | default([]) %}
+          {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " tmpfs " ~ t.name ~ " destination '" ~ t.destination ~ "'"}) %}
+          {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " tmpfs " ~ t.name ~ " size '" ~ (t.size | default(1)) ~ "'"}) %}
+          {%   endfor %}
+          {%   for v in c.volumes | default([]) %}
+          {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " volume " ~ v.name ~ " destination '" ~ v.destination ~ "'"}) %}
+          {%     set _ = out.append({'nom': c.name, 'ligne': "set container name " ~ c.name ~ " volume " ~ v.name ~ " source '" ~ v.source ~ "'"}) %}
+          {%   endfor %}
+          {% endfor %}
+          {{ out | rejectattr('ligne', 'in', _cfg.stdout_lines) | list | to_json }}
+      tags: [check, apply]
+
+    - name: "check — lecture seule"
+      ansible.builtin.debug:
+        msg: >-
+          lecture seule {{ 'ACTIVEE' if _ro_actif else 'desactivee' }} dans
+          l'inventaire ; reglage {{ 'POSE' if _ro_dropin_stat.stat.exists else 'absent' }}
+          sur le routeur ; {{ _ro_a_poser | length }} ligne(s) tmpfs/volume a poser
+          {%- if _ro_a_poser %} ({{ _ro_a_poser | map(attribute='nom') | unique | join(', ') }}){% endif %} ;
+          {% if _ro_actif != _ro_dropin_stat.stat.exists %}le prochain apply
+          REDEMARRERA les {{ _ro_routeur | length }} conteneurs.{% endif %}
+      tags: [check, apply]
+
     # --- pull ----------------------------------------------------------
     # Volontairement AVANT toute ecriture : un echec ici -- registre
     # injoignable, tag inexistant -- laisse le routeur exactement dans l'etat
@@ -272,6 +377,19 @@
     #    interactif. Ne pas rendre l'hote entier `become: false` pour autant --
     #    les taches qui deposent des fichiers de conf, elles, en ont besoin.
 
+    - name: "apply — lecture seule : repertoires des volumes"
+      ansible.builtin.file:
+        path: "{{ item.1.source }}"
+        state: directory
+        owner: "{{ item.1.owner | default(omit) }}"
+        group: "{{ item.1.group | default(omit) }}"
+        mode: "{{ item.1.mode | default('0700') }}"
+      loop: "{{ _ro_table | subelements('volumes', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.name }}:{{ item.1.destination }}"
+      when: _ro_actif
+      tags: [apply]
+
     - name: "apply — poser les tags, commit et save"
       become: false
       ansible.builtin.shell:
@@ -284,6 +402,9 @@
           {% for i in _a_changer %}
           $W set container name {{ i.nom }} image "{{ i.voulue }}"
           {% endfor %}
+          {% for r in _ro_a_poser %}
+          $W {{ r.ligne | replace("'", "") }}
+          {% endfor %}
           $W commit
           $W save
           $W end || echo "AVERTISSEMENT: teardownSession a rendu $?, la session reste montee sous /opt/vyatta/config/tmp/" >&2
@@ -291,7 +412,7 @@
         executable: /bin/bash
       changed_when: true
       when:
-        - _a_changer | length > 0
+        - (_a_changer | length > 0) or (_ro_a_poser | length > 0)
         - not ansible_check_mode
       tags: [apply]
 
@@ -304,7 +425,19 @@
       register: _cfg_apres
       changed_when: false
       when:
-        - _a_changer | length > 0
+        - (_a_changer | length > 0) or (_ro_a_poser | length > 0)
+        - not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — verifier les lignes tmpfs/volume"
+      ansible.builtin.assert:
+        that: _ro_a_poser | map(attribute='ligne') | reject('in', _cfg_apres.stdout_lines) | list | length == 0
+        fail_msg: >-
+          Lignes absentes apres commit :
+          {{ _ro_a_poser | map(attribute='ligne') | reject('in', _cfg_apres.stdout_lines) | list }}
+        quiet: true
+      when:
+        - _ro_a_poser | length > 0
         - not ansible_check_mode
       tags: [apply]
 
@@ -329,19 +462,97 @@
         - not ansible_check_mode
       tags: [apply]
 
+    # Le reglage global : pose si l'inventaire l'active, retire sinon. Pose
+    # APRES le commit des tmpfs : un conteneur ne doit jamais redemarrer en
+    # lecture seule sans eux.
+    - name: "apply — lecture seule : repertoire des drop-in"
+      ansible.builtin.file:
+        path: "{{ _ro_dropin_dir }}"
+        state: directory
+        mode: "0755"
+      when: _ro_actif and not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — lecture seule : reglage global"
+      ansible.builtin.copy:
+        dest: "{{ _ro_dropin }}"
+        mode: "0644"
+        content: |
+          # Gere par image-update.yaml (vyos-deploy). Rootfs en lecture seule
+          # pour TOUS les conteneurs ; un conteneur de maintenance qui doit
+          # ecrire dans son image passe --read-only=false.
+          [containers]
+          read_only = true
+      register: _ro_pose
+      when: _ro_actif and not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — lecture seule : recree a chaque boot"
+      ansible.builtin.blockinfile:
+        path: "{{ _ro_preconfig }}"
+        marker: "{{ _ro_marker }}"
+        block: |
+          mkdir -p {{ _ro_dropin_dir }}
+          printf '[containers]\nread_only = true\n' > {{ _ro_dropin }}
+      when: _ro_actif and not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — lecture seule : retirer le reglage"
+      ansible.builtin.file:
+        path: "{{ _ro_dropin }}"
+        state: absent
+      register: _ro_retire
+      when: not _ro_actif and _ro_dropin_stat.stat.exists and not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — lecture seule : retirer sa recreation au boot"
+      ansible.builtin.blockinfile:
+        path: "{{ _ro_preconfig }}"
+        marker: "{{ _ro_marker }}"
+        state: absent
+      when: not _ro_actif and _ro_dropin_stat.stat.exists and not ansible_check_mode
+      tags: [apply]
+
+    # Qui redemarre : ceux dont l'image ou les tmpfs/volumes changent ; TOUS
+    # quand le reglage global apparait ou disparait. Ordre du tableau de
+    # lecture seule (du moins risque au plus risque), puis les autres.
+    #
     # Le commit a recree les containers HORS du chemin systemd. Pour squid,
     # cela fait disparaitre les regles nft REDIRECT en silence et tout le VLAN
     # perd HTTPS -- sans qu'aucune sonde applicative ne bronche, le proxy
     # lui-meme allant tres bien. `restart container` repasse par l'unite
     # systemd, qui redeclenche le service de redirection.
+    - name: "apply — conteneurs a redemarrer"
+      ansible.builtin.set_fact:
+        _a_redemarrer: "{{ _ordre | from_json }}"
+      vars:
+        _bascule: "{{ (_ro_pose is changed) or (_ro_retire is changed) }}"
+        _touches: >-
+          {{ (_ro_routeur if _bascule
+              else ((_a_changer | map(attribute='nom') | list)
+                    + (_ro_a_poser | map(attribute='nom') | list)))
+             | unique | list }}
+        _ordre: >-
+          {% set out = [] %}
+          {% for c in _ro_table %}{% if c.name in _touches %}{% set _ = out.append(c) %}{% endif %}{% endfor %}
+          {% for n in _touches %}{% if n not in _ro_noms_table %}{% set _ = out.append({'name': n}) %}{% endif %}{% endfor %}
+          {{ out | to_json }}
+      when: not ansible_check_mode
+      tags: [apply]
 
-    - name: "apply — redemarrer par systemd"
-      ansible.builtin.command:
-        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper restart container {{ item.nom }}"
-      loop: "{{ _a_changer }}"
+    # Un a la fois, verifie (en marche, ReadonlyRootfs conforme, meme date de
+    # demarrage 20 s plus tard) ; le premier qui ne tient pas arrete le run.
+    - name: "apply — redemarrer par systemd et verifier"
+      ansible.builtin.include_tasks:
+        file: tasks/readonly-restart-verify.yml
+        apply:
+          tags: [apply]
+      loop: "{{ _a_redemarrer | default([]) }}"
       loop_control:
-        label: "{{ item.nom }}"
-      changed_when: true
+        loop_var: _c
+        label: "{{ _c.name }}"
+      vars:
+        _ro_attendu: "{{ _ro_actif }}"
       when: not ansible_check_mode
       tags: [apply]
 
