@@ -97,6 +97,10 @@
     # Le sous-ensemble qui bouge. Evalue a l'usage, donc toujours a jour vis-a-vis
     # de `_table` -- les phases `pull` et `apply` bouclent la-dessus et rien d'autre.
     _a_changer: "{{ (_table | default([])) | selectattr('change') | list }}"
+    _post_update: >-
+      {{ _a_changer
+         | selectattr('nom', 'in', (vyos_container_post_update | default({}) | list))
+         | list }}
 
   tasks:
     - name: Fail early when the inventory declares nothing
@@ -341,28 +345,48 @@
       when: not ansible_check_mode
       tags: [apply]
 
-    # Apres-montee propre a un service : une commande a jouer quand SON image
-    # vient de changer, une fois le conteneur redemarre. Cas d'ecole : un IDS
-    # dont les regles se telechargent pour une version precise du moteur --
-    # sans ce passage, le nouveau moteur tournerait avec les regles de
-    # l'ancien jusqu'a la prochaine mise a jour planifiee.
+    # Apres-montee propre a un service : quand SON image vient de changer, une
+    # fois le conteneur redemarre, (1) deposer un script depuis le depot,
+    # (2) le lancer. Cas d'ecole : un IDS dont les regles se telechargent pour
+    # une version precise du moteur -- sans ce passage, le nouveau moteur
+    # tourne avec les regles de l'ancien jusqu'a la mise a jour planifiee.
     #
     #   vyos_container_post_update:
-    #     suricata: /config/scripts/suricata-update.sh
+    #     suricata:
+    #       src: "{{ suricata_conf }}/suricata-update.sh"   # cote controleur
+    #       dest: /config/scripts/suricata-update.sh        # cote routeur
+    #       owner: radius_user                              # optionnels
+    #       group: vyattacfg
+    #       mode: "0775"
+    #
+    # Le script est DEPOSE ici, pas seulement lance : sinon l'apres-montee
+    # executerait la copie du routeur, celle du dernier `<service>-deploy`, qui
+    # peut etre plus ancienne que le depot (et l'image-update tourne en vague 0
+    # de la pile, AVANT les `*-deploy`). Le depot est la seule version sure.
     #
     # Rien ne tourne pour un service dont l'image n'a pas change. Un code de
-    # sortie non nul fait echouer le run : l'image est en place, mais
-    # l'apres-montee est a reprendre.
-    - name: "apply — commandes d'apres-montee"
+    # sortie non nul fait echouer le run : l'image est en place, l'apres-montee
+    # est a reprendre.
+    - name: "apply — deposer les scripts d'apres-montee"
+      ansible.builtin.copy:
+        src: "{{ vyos_container_post_update[item.nom].src }}"
+        dest: "{{ vyos_container_post_update[item.nom].dest }}"
+        owner: "{{ vyos_container_post_update[item.nom].owner | default(omit) }}"
+        group: "{{ vyos_container_post_update[item.nom].group | default(omit) }}"
+        mode: "{{ vyos_container_post_update[item.nom].mode | default('0755') }}"
+      loop: "{{ _post_update }}"
+      loop_control:
+        label: "{{ item.nom }} : {{ vyos_container_post_update[item.nom].dest }}"
+      when: not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — lancer les scripts d'apres-montee"
       become: false
       ansible.builtin.command:
-        cmd: "{{ vyos_container_post_update[item.nom] }}"
-      loop: >-
-        {{ _a_changer
-           | selectattr('nom', 'in', (vyos_container_post_update | default({}) | list))
-           | list }}
+        cmd: "{{ vyos_container_post_update[item.nom].dest }}"
+      loop: "{{ _post_update }}"
       loop_control:
-        label: "{{ item.nom }} : {{ vyos_container_post_update[item.nom] }}"
+        label: "{{ item.nom }}"
       changed_when: true
       when: not ansible_check_mode
       tags: [apply]
