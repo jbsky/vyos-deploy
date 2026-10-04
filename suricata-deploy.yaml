@@ -19,6 +19,9 @@
 #   script   → copier le script de mise à jour des règles (task-scheduler)
 #   service  → redémarrer le container suricata
 #   check    → vérifier que le container tourne
+#   logrotate → rotation des journaux (remplace celle du paquet de l'image
+#               VyOS, cassee en conteneur), conservee dans /config et
+#               reinstallee a chaque boot
 #
 # Exemples :
 #   ansible-playbook suricata-deploy.yaml
@@ -110,6 +113,62 @@
         group: vyattacfg
         mode: "0775"
       tags: [script]
+
+    # ── Rotation des journaux ──────────────────────────────────────
+    # La configuration du paquet Debian (dans l'image VyOS) a un postrotate
+    # qui signale le pid HOTE de Suricata, absent puisqu'il tourne en
+    # conteneur : logrotate echoue avant de compresser, et chaque semaine un
+    # `.1-<date>.backup` s'ajoute sans jamais etre purge. Celle-ci la
+    # remplace. /etc appartient a l'image systeme : la copie dans /config est
+    # reinstallee a chaque boot par le script de post-configuration.
+    - name: logrotate — source presente ?
+      ansible.builtin.stat:
+        path: "{{ suricata_conf }}/logrotate"
+      delegate_to: localhost
+      become: false
+      register: _logrotate_src
+      tags: [logrotate]
+
+    - name: logrotate — conserver dans /config
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/logrotate"
+        dest: /config/etc/logrotate/suricata
+        owner: root
+        group: root
+        mode: "0644"
+      when: _logrotate_src.stat.exists
+      tags: [logrotate]
+
+    - name: logrotate — installer (remplace celle du paquet)
+      ansible.builtin.copy:
+        src: "{{ suricata_conf }}/logrotate"
+        dest: /etc/logrotate.d/suricata
+        owner: root
+        group: root
+        mode: "0644"
+      when: _logrotate_src.stat.exists
+      tags: [logrotate]
+
+    - name: logrotate — reinstaller a chaque boot
+      ansible.builtin.blockinfile:
+        path: /config/scripts/vyos-postconfig-bootup.script
+        marker: "# {mark} suricata logrotate (vyos-deploy)"
+        block: |
+          [ -f /config/etc/logrotate/suricata ] && \
+            install -m 0644 -o root -g root /config/etc/logrotate/suricata /etc/logrotate.d/suricata
+      when: _logrotate_src.stat.exists
+      tags: [logrotate]
+
+    # `logrotate -d` simule sans rien toucher ; une erreur de syntaxe ou un
+    # fichier ignore (mauvais proprietaire/mode) sort sur stderr.
+    - name: logrotate — valider
+      ansible.builtin.command:
+        cmd: logrotate -d /etc/logrotate.d/suricata
+      register: _logrotate_debug
+      changed_when: false
+      failed_when: _logrotate_debug.rc != 0 or ('error' in (_logrotate_debug.stderr | lower))
+      when: _logrotate_src.stat.exists
+      tags: [logrotate]
 
   handlers:
     - name: Restart suricata

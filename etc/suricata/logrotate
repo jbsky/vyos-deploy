@@ -1,0 +1,23 @@
+# Rotation des journaux de Suricata -- deposee par suricata-deploy.yaml
+# (tag logrotate) dans /etc/logrotate.d/suricata, ou elle REMPLACE celle du
+# paquet Debian embarque dans l'image VyOS.
+#
+# Celle du paquet a un postrotate `kill -HUP $(cat /var/run/suricata.pid)` :
+# Suricata tourne dans un conteneur, ce pid n'existe pas sur l'hote. L'echec
+# arrete logrotate AVANT la compression ; le `.1` reste, et la rotation
+# suivante le renomme `.1-<date>.backup`, que plus rien ne purge.
+#
+# copytruncate suffit : Suricata ecrit en ajout sur le meme descripteur, il
+# n'y a rien a lui signaler. Un lecteur qui suit le fichier (rsyslog imfile)
+# doit accepter la troncature (reopenOnTruncate).
+/var/log/suricata/*.log /var/log/suricata/*.json
+{
+    daily
+    maxsize 100M
+    rotate 10
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
