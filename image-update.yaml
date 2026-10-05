@@ -247,8 +247,10 @@
     #   vyos_container_readonly_enabled: true
     #   vyos_container_readonly:            # ordre = ordre des redemarrages
     #     - name: clamav                    # a la bascule, du moins risque
-    #       tmpfs:                          # au plus risque
-    #         - {name: run, destination: /run/clamav, size: 1}
+    #       volumes:                        # au plus risque
+    #         - {name: clamav-run, destination: /run/clamav,
+    #            source: /config/containers/clamav/run,
+    #            owner: 4000, group: 4000, mode: "2755"}
     #     - name: c-icap
     #       volumes:                        # ecritures volumineuses : disque
     #         - {name: spool, destination: /tmp,
@@ -264,7 +266,17 @@
     # VyOS ne regenere pas (containers.conf, lui, l'est a chaque commit).
     # `read_only_tmpfs` (vrai par defaut) met des tmpfs 1777 sur /run, /tmp,
     # /var/tmp, /dev/shm -- qui MASQUENT ce que l'image avait prepare dessous
-    # (un /run/<service> possede par le service) : d'ou les `tmpfs` declares.
+    # (un /run/<service> possede par le service) : d'ou les tmpfs/volumes
+    # declares.
+    #
+    # PIEGE (VyOS 2026.10, Podman 5.8.4) : un `tmpfs` pose sur un repertoire
+    # que l'image possede deja arrive en root:root 0755 -- le proprietaire
+    # n'est pas repris, `tmpfs-mode` est ignore, seule l'option `U` corrige et
+    # la CLI VyOS ne l'expose pas. Un service non-root n'y ecrit plus et ne
+    # demarre pas. Pour un /run/<service> d'un service non-root : un VOLUME
+    # (owner/group/mode du service). Revers : un fichier pid y survit au
+    # redemarrage, l'image doit le tolerer. Un tmpfs reste valable sur une
+    # destination ABSENTE de l'image (cree en 1777).
     #
     # Consequences, voulues :
     # - les tmpfs/volumes se posent pour TOUS les conteneurs du tableau, quel
