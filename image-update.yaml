@@ -546,9 +546,12 @@
       ansible.builtin.blockinfile:
         path: "{{ _ro_preconfig }}"
         marker: "{{ _ro_marker }}"
+        # MEME contenu que la tache ci-dessus, octet pour octet : une version
+        # courte recreee au boot faisait voir un « changement » au run
+        # suivant (cf. _bascule plus bas).
         block: |
           mkdir -p {{ _ro_dropin_dir }}
-          printf '[containers]\nread_only = true\n' > {{ _ro_dropin }}
+          printf '%s\n' '# Gere par image-update.yaml (vyos-deploy). Rootfs en lecture seule' '# pour TOUS les conteneurs ; un conteneur de maintenance qui doit' '# ecrire dans son image passe --read-only=false.' '[containers]' 'read_only = true' > {{ _ro_dropin }}
       when: _ro_actif and not ansible_check_mode
       tags: [apply]
 
@@ -569,7 +572,10 @@
       tags: [apply]
 
     # Qui redemarre : ceux dont l'image ou les tmpfs/volumes changent ; TOUS
-    # quand le reglage global apparait ou disparait. Ordre du tableau de
+    # quand le reglage global apparait ou disparait -- son EXISTENCE avant le
+    # run, pas son contenu : le 2026-10-05, le premier apply apres le reboot
+    # de la montee VyOS a redemarre les 7 conteneurs parce que le boot avait
+    # recree le fichier sans ses commentaires (`_ro_pose` changed). Ordre du tableau de
     # lecture seule (du moins risque au plus risque), puis les autres.
     #
     # Le commit a recree les containers HORS du chemin systemd. Pour squid,
@@ -581,7 +587,7 @@
       ansible.builtin.set_fact:
         _a_redemarrer: "{{ _ordre | from_json }}"
       vars:
-        _bascule: "{{ (_ro_pose is changed) or (_ro_retire is changed) }}"
+        _bascule: "{{ (_ro_actif and not _ro_dropin_stat.stat.exists) or (_ro_retire is changed) }}"
         _touches: >-
           {{ (_ro_routeur if _bascule
               else ((_a_changer | map(attribute='nom') | list)
