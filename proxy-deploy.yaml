@@ -196,11 +196,21 @@
         state: link
       tags: [redirect]
 
-    - name: squid-redirect — activer (liens de [Install])
+    # `systemctl enable` lui-meme, pas le module systemd : celui-ci demande
+    # d'abord `is-enabled`, voit « enabled » (multi-user.target) et ne relit
+    # jamais [Install] -- le lien vers squid n'etait pas cree (run du
+    # 2026-10-05, arrete par le controle ci-dessous). `enable` sur une unite
+    # deja activee cree les liens manquants et ne la redemarre pas.
+    - name: squid-redirect — recharger systemd
       ansible.builtin.systemd:
-        name: squid-redirect.service
-        enabled: true
         daemon_reload: true
+      tags: [redirect]
+
+    - name: squid-redirect — activer (tous les liens de [Install])
+      ansible.builtin.command:
+        cmd: systemctl enable squid-redirect.service
+      register: _redirect_enable
+      changed_when: "'Created symlink' in _redirect_enable.stderr"
       tags: [redirect]
 
     - name: squid-redirect — squid la reclame bien
