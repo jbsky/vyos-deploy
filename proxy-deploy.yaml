@@ -25,6 +25,8 @@
 #   squid_certs   → déployer uniquement les certs Squid SSL-bump
 #   icap_config   → copier uniquement la conf c-icap + squidclamav
 #   clamav_config → copier uniquement la conf ClamAV
+#   redirect      → unite squid-redirect (regles nft du proxy transparent),
+#                   relancee a chaque demarrage de squid ; ne la redemarre pas
 #
 # Exemples :
 #   ansible-playbook proxy-deploy.yaml
@@ -64,6 +66,7 @@
         squid_conf: "{{ squid_conf | default(playbook_dir + '/etc/squid') }}"
         cicap_conf: "{{ cicap_conf | default(playbook_dir + '/etc/c-icap') }}"
         clam_conf: "{{ clam_conf | default(playbook_dir + '/etc/clamav') }}"
+        squid_redirect_unit: "{{ squid_redirect_unit | default(playbook_dir + '/etc/systemd/squid-redirect.service') }}"
       delegate_to: localhost
       tags: always
 
@@ -170,6 +173,44 @@
         mode: "0640"
       notify: Restart clamav
       tags: [config, clamav_config]
+
+    # ── Proxy transparent : squid-redirect ─────────────────────
+    # L'unite vit dans /config/etc/services/ (le postconfig la lie dans /etc a
+    # chaque boot). `enabled` recree les liens de [Install], dont celui de
+    # vyos-container-squid.service.wants/ : squid la relance a chaque
+    # demarrage. PAS de redemarrage ici : il viderait les regles nft le temps
+    # de les reposer, pour un changement qui ne porte que sur [Install].
+    - name: squid-redirect — deposer l'unite
+      ansible.builtin.copy:
+        src: "{{ squid_redirect_unit }}"
+        dest: /config/etc/services/squid-redirect.service
+        owner: root
+        group: vyattacfg
+        mode: "0644"
+      tags: [redirect]
+
+    - name: squid-redirect — lier dans /etc (comme le postconfig au boot)
+      ansible.builtin.file:
+        src: /config/etc/services/squid-redirect.service
+        dest: /etc/systemd/system/squid-redirect.service
+        state: link
+      tags: [redirect]
+
+    - name: squid-redirect — activer (liens de [Install])
+      ansible.builtin.systemd:
+        name: squid-redirect.service
+        enabled: true
+        daemon_reload: true
+      tags: [redirect]
+
+    - name: squid-redirect — squid la reclame bien
+      ansible.builtin.command:
+        cmd: systemctl show vyos-container-squid.service -p Wants --value
+      register: _squid_wants
+      changed_when: false
+      failed_when: "'squid-redirect.service' not in _squid_wants.stdout.split()"
+      check_mode: false
+      tags: [redirect]
 
   # Restart order: clamav → c-icap → squid (dependency chain). Pas de
   # wait_for entre les restarts : les IPs de bridge podman (172.20.0.0/24)

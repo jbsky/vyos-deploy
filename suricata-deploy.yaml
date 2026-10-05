@@ -24,6 +24,8 @@
 #               reinstallee a chaque boot
 #   rsyslog  → transmission d'eve.json et fast.log au syslog (donc au collecteur
 #               distant), conservee dans /config et reinstallee a chaque boot
+#   logdir   → /var/log/suricata (source du volume `logs`) cree au proprietaire
+#               du conteneur, maintenant et a chaque boot AVANT les conteneurs
 #
 # Exemples :
 #   ansible-playbook suricata-deploy.yaml
@@ -217,6 +219,29 @@
           fi
       when: _rsyslog_src.stat.exists
       tags: [rsyslog]
+
+    # ── Repertoire des journaux ────────────────────────────────────
+    # Source du volume `logs` sous /var/log, qui appartient a l'image systeme :
+    # une montee d'image VyOS le recree en root et Suricata (uid 8000) n'y
+    # ecrit plus (constate le 2026-10-05). Le script de PRE-configuration
+    # tourne avant la creation des conteneurs ; `install -d` corrige aussi
+    # proprietaire et mode d'un repertoire existant.
+    - name: logdir — proprietaire maintenant
+      ansible.builtin.file:
+        path: /var/log/suricata
+        state: directory
+        owner: "8000"
+        group: "8000"
+        mode: "0755"
+      tags: [logdir]
+
+    - name: logdir — a chaque boot, avant les conteneurs
+      ansible.builtin.blockinfile:
+        path: /config/scripts/vyos-preconfig-bootup.script
+        marker: "# {mark} suricata logdir (vyos-deploy)"
+        block: |
+          install -d -o 8000 -g 8000 -m 0755 /var/log/suricata
+      tags: [logdir]
 
   handlers:
     - name: Restart rsyslog
