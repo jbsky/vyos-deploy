@@ -67,6 +67,9 @@
         cicap_conf: "{{ cicap_conf | default(playbook_dir + '/etc/c-icap') }}"
         clam_conf: "{{ clam_conf | default(playbook_dir + '/etc/clamav') }}"
         squid_redirect_unit: "{{ squid_redirect_unit | default(playbook_dir + '/etc/systemd/squid-redirect.service') }}"
+        # table du PBR (policy route ... set table N) et IP du conteneur squid
+        tproxy_table: "{{ tproxy_table | default(100) }}"
+        tproxy_nexthop: "{{ tproxy_nexthop | default('172.20.0.10') }}"
       delegate_to: localhost
       tags: always
 
@@ -242,6 +245,51 @@
       check_mode: false
       when: not (ansible_check_mode and (_redirect_unit | default({})) is changed)
       tags: [redirect, check]
+
+    # ── Postconfig : ancien bloc manuel du proxy transparent ──
+    # Pose a la main en juin 2026, hors Ansible : `ip route add` dans la table
+    # du PBR + une exception iptables dans NETAVARK-HOSTPORT-MASQ. Depuis
+    # netavark 1.14 (pilote nftables) cette chaine n'existe plus : la commande
+    # echouait au boot et le script journalisait quand meme « fixes applied ».
+    # L'exception est remplacee par la table squid_tproxy (squid-redirect),
+    # la route par le bloc gere ci-dessous.
+    - name: Postconfig — retirer l'ancien bloc manuel du proxy transparent
+      ansible.builtin.replace:
+        path: /config/scripts/vyos-postconfig-bootup.script
+        regexp: '(?ms)^# ── Transparent proxy PBR fixes .*?^logger -t vyos-postconfig -p user\.info "Transparent proxy PBR fixes applied[^\n]*\n\n?'
+        replace: ''
+        validate: sh -n %s
+      tags: [redirect]
+
+    # VyOS installe lui-meme la route statique de la table (FRR) ; on ne pose
+    # celle de secours que si elle manque, et on le dit -- un correctif qui
+    # tourne en silence a masque la panne du 2026-10-05.
+    - name: Postconfig — route de la table du PBR controlee au boot
+      ansible.builtin.blockinfile:
+        path: /config/scripts/vyos-postconfig-bootup.script
+        marker: "# {mark} ANSIBLE MANAGED BLOCK transparent-proxy-route"
+        validate: sh -n %s
+        block: |
+          # ── Proxy transparent : route de la table {{ tproxy_table }} (PBR) ──
+          if ip -4 route show table {{ tproxy_table }} default | grep -q .; then
+              logger -t vyos-postconfig -p user.info "table {{ tproxy_table }} : route par defaut presente ($(ip -4 route show table {{ tproxy_table }} default))"
+          else
+              ip route add default via {{ tproxy_nexthop }} table {{ tproxy_table }} && \
+                  logger -t vyos-postconfig -p user.warning "table {{ tproxy_table }} : route statique VyOS absente, route de secours posee via {{ tproxy_nexthop }}" || \
+                  logger -t vyos-postconfig -p user.err "table {{ tproxy_table }} : aucune route, proxy transparent hors service"
+          fi
+      tags: [redirect]
+
+    # Les certificats de squid sont sous conf/ssl_cert (cf. tache « Deploy
+    # squid config directory ») : l'ancien chemin faisait crier MISSING CERT
+    # a chaque boot, certificats presents.
+    - name: Postconfig — chemin des certificats de squid
+      ansible.builtin.replace:
+        path: /config/scripts/vyos-postconfig-bootup.script
+        regexp: '{{ vyos_base }}/squid/ssl_cert/'
+        replace: '{{ vyos_base }}/squid/conf/ssl_cert/'
+        validate: sh -n %s
+      tags: [redirect, certs]
 
   # Restart order: clamav → c-icap → squid (dependency chain). Pas de
   # wait_for entre les restarts : les IPs de bridge podman (172.20.0.0/24)
