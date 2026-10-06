@@ -8,6 +8,17 @@
 # relance. Sans lui, BindsTo l'arretait avec squid (crash au boot, restart,
 # montee d'image) et rien ne la relancait : plus de proxy transparent, sans
 # erreur (constate apres la montee VyOS du 2026-10-05).
+#
+# Table hote ip squid_tproxy : le PBR VyOS (policy route ... set table 100)
+# marque les paquets 0x7fffffff - 100 = 0x7fffff9b. Podman 5 (netavark,
+# pilote nftables) masquerade en postrouting tout paquet dont la marque porte
+# le bit 0x2000 (`meta mark & 0x2000 == 0x2000 masquerade`, prevu pour ses
+# ports publies en epingle) -- la marque PBR le porte aussi. Resultat depuis
+# VyOS 2026.10 : squid voit tous les clients interceptes avec l'IP du pont
+# (172.20.0.1), aucune ACL par source ne correspond, tout est refuse. On
+# retire le bit 0x2000 de CETTE marque seulement, apres le routage (deja
+# decide) et avant le NAT (priorite 100). Table a nous : netavark recrit la
+# sienne a chaque changement de conteneur.
 [Unit]
 RequiresMountsFor=/config
 Description=Inject nftables REDIRECT into squid container netns
@@ -19,6 +30,10 @@ PartOf=vyos-container-squid.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table ip squid_tproxy
+ExecStartPre=/usr/sbin/nft add table ip squid_tproxy
+ExecStartPre=/usr/sbin/nft add chain ip squid_tproxy postrouting "{ type filter hook postrouting priority 90; policy accept; }"
+ExecStartPre=/usr/sbin/nft add rule ip squid_tproxy postrouting oifname "pod-webproxy" meta mark 0x7fffff9b meta mark set meta mark and 0xffffdfff
 ExecStartPre=/bin/sleep 3
 ExecStart=/bin/bash -c '\
   PID=$(podman inspect squid --format "{{.State.Pid}}") && \

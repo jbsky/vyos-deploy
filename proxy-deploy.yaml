@@ -178,8 +178,9 @@
     # L'unite vit dans /config/etc/services/ (le postconfig la lie dans /etc a
     # chaque boot). `enabled` recree les liens de [Install], dont celui de
     # vyos-container-squid.service.wants/ : squid la relance a chaque
-    # demarrage. PAS de redemarrage ici : il viderait les regles nft le temps
-    # de les reposer, pour un changement qui ne porte que sur [Install].
+    # demarrage. Redemarrage seulement si l'unite a change (oneshot +
+    # RemainAfterExit : un ExecStart* modifie ne s'execute qu'au prochain
+    # demarrage) ; il vide les regles nft du netns ~3 s, squid n'est pas touche.
     - name: squid-redirect — deposer l'unite
       ansible.builtin.copy:
         src: "{{ squid_redirect_unit }}"
@@ -187,6 +188,7 @@
         owner: root
         group: vyattacfg
         mode: "0644"
+      register: _redirect_unit
       tags: [redirect]
 
     - name: squid-redirect — lier dans /etc (comme le postconfig au boot)
@@ -221,6 +223,25 @@
       failed_when: "'squid-redirect.service' not in _squid_wants.stdout.split()"
       check_mode: false
       tags: [redirect]
+
+    - name: squid-redirect — redemarrer (unite modifiee)
+      ansible.builtin.systemd:
+        name: squid-redirect.service
+        state: restarted
+      when: _redirect_unit is changed
+      tags: [redirect]
+
+    # Sans elle, netavark masquerade le trafic intercepte : squid voit l'IP du
+    # pont, plus celle du client (cf. commentaire de l'unite).
+    - name: squid-redirect — la marque PBR ne declenche plus le masquerade
+      ansible.builtin.command:
+        cmd: nft list chain ip squid_tproxy postrouting
+      register: _tproxy_chain
+      changed_when: false
+      failed_when: "'meta mark 0x7fffff9b' not in _tproxy_chain.stdout"
+      check_mode: false
+      when: not (ansible_check_mode and (_redirect_unit | default({})) is changed)
+      tags: [redirect, check]
 
   # Restart order: clamav → c-icap → squid (dependency chain). Pas de
   # wait_for entre les restarts : les IPs de bridge podman (172.20.0.0/24)
