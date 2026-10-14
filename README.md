@@ -176,7 +176,7 @@ configuration ne doit jamais changer une version d'image en passant. Les
 `<service>-deploy.yaml` continuent d'appeler la vérification seule.
 
 Déroulé : pré-tirage des images -> une seule transaction `set`/`commit`/`save`
--> relecture de la configuration pour vérifier -> redémarrage par systemd.
+-> relecture de la configuration -> vérification de chaque conteneur.
 
 Trois raisons à cet ordre :
 
@@ -185,10 +185,28 @@ Trois raisons à cet ordre :
   terre. Un échec au pré-tirage laisse le routeur intact.
 - **Une seule transaction** : un `commit` par conteneur laisserait un état mixte
   si le second échouait.
-- **Le redémarrage à la fin** : le `commit` recrée les conteneurs **hors** du
-  chemin systemd. Pour Squid, les règles nft REDIRECT disparaissent alors en
-  silence et tout le VLAN concerné perd HTTPS, sans qu'aucune sonde applicative
-  ne bronche. `restart container` repasse par l'unité systemd.
+- **La vérification à la fin, pas un redémarrage** : depuis que VyOS pilote ses
+  conteneurs par des unités *quadlet*, le `commit` fait lui-même
+  `systemctl restart vyos-container-<nom>` pour chaque conteneur dont la
+  configuration change. Il passe donc par systemd, et avec lui par les unités
+  qui dépendent du conteneur. Redémarrer derrière lui coupait chaque service une
+  seconde fois pour rien. Le playbook ne redémarre plus que les conteneurs que
+  le `commit` n'a pas touchés — bascule du réglage global de lecture seule
+  (posé *après* le `commit`, donc invisible pour lui), conteneur sans ligne
+  `set` dans la transaction — ou tous avec `-e force_restart=true`.
+
+En échange, ce qui était garanti par le redémarrage est désormais **vérifié** :
+chaque conteneur tourne, sur l'image attendue (celle du conteneur, pas celle de
+la configuration : VyOS pose la ligne, commite, et passe le redémarrage en
+silence si l'image manque en local), avec le rootfs en lecture seule conforme et
+une date de démarrage stable. Et pour Squid, que l'unité qui injecte les règles
+nft du proxy transparent est bien repartie **avec** le conteneur : sans elle le
+proxy va très bien, aucune sonde applicative ne bronche, et le VLAN intercepté
+perd HTTPS.
+
+L'état final n'est donc plus produit par un redémarrage ordonné un à un, mais
+par celui du `commit` — les conteneurs dans l'ordre de VyOS. C'est assumé : à
+chaque démarrage du routeur, cet ordre est déjà arbitraire.
 
 La référence doit être **complète** (`docker.io/...`) : `registries.conf`
 déclare un registre de recherche par défaut qui n'est pas Docker Hub, et un nom
