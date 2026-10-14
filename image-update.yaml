@@ -41,8 +41,14 @@
 #   --tags check    constate la derive, ne touche a rien
 #   --tags pull     telecharge les images seulement
 #   --tags apply    lance les avant-montees, pose les tags (et les
-#                   tmpfs/volumes de la lecture seule), commit, save, verifie,
-#                   redemarre un conteneur a la fois, lance les apres-montees
+#                   tmpfs/volumes de la lecture seule), commit, save, verifie
+#                   la configuration PUIS chaque conteneur (en marche, image
+#                   attendue, lecture seule conforme), lance les apres-montees.
+#                   Le commit de VyOS redemarre lui-meme, par systemd, chaque
+#                   conteneur dont la config change : le playbook ne redemarre
+#                   que ceux qu'il a laisses de cote (bascule de la lecture
+#                   seule, conteneur hors transaction), ou tous sur
+#                   `-e force_restart=true`
 #   --tags prune    supprime les images qu'aucun conteneur n'utilise. Jamais
 #                   comprise dans « tout » : il faut la demander.
 #
@@ -571,39 +577,77 @@
       when: not _ro_actif and _ro_dropin_stat.stat.exists and not ansible_check_mode
       tags: [apply]
 
-    # Qui redemarre : ceux dont l'image ou les tmpfs/volumes changent ; TOUS
+    # QUI est touche : ceux dont l'image ou les tmpfs/volumes changent ; TOUS
     # quand le reglage global apparait ou disparait -- son EXISTENCE avant le
     # run, pas son contenu : le 2026-10-05, le premier apply apres le reboot
     # de la montee VyOS a redemarre les 7 conteneurs parce que le boot avait
     # recree le fichier sans ses commentaires (`_ro_pose` changed). Ordre du tableau de
     # lecture seule (du moins risque au plus risque), puis les autres.
     #
-    # Le commit a recree les containers HORS du chemin systemd. Pour squid,
-    # cela fait disparaitre les regles nft REDIRECT en silence et tout le VLAN
-    # perd HTTPS -- sans qu'aucune sonde applicative ne bronche, le proxy
-    # lui-meme allant tres bien. `restart container` repasse par l'unite
-    # systemd, qui redeclenche le service de redirection.
-    - name: "apply — conteneurs a redemarrer"
+    # QUI REDEMARRE, parmi eux : ceux que le commit n'a PAS redemarres.
+    #
+    # Depuis que VyOS pilote ses conteneurs par des unites quadlet, `apply()` de
+    # conf_mode/container.py fait `systemctl restart vyos-container-<nom>` pour
+    # chaque conteneur dont un noeud de config a change (`is_node_changed`) :
+    # le commit passe DEJA par systemd, donc par les unites qui dependent du
+    # conteneur (squid-redirect et ses regles nft, cf. le controle plus bas).
+    # Redemarrer derriere lui coupait une 2e fois chaque service pour rien --
+    # mesure au run 815 (2026-10-14) : squid arrete a 09:30:15 par le commit,
+    # redirection reposee a 09:30:18, puis re-arrete a 09:35:02 par ce playbook,
+    # et ~5 min de job en plus. Suricata en prenait meme un 3e avec son
+    # apres-montee. Ce n'etait pas toujours faux : avant les quadlets, le commit
+    # recreait les conteneurs hors du chemin systemd et les regles nft REDIRECT
+    # disparaissaient en silence (tout le VLAN perdait HTTPS sans qu'une sonde
+    # applicative ne bronche) -- d'ou cette tache, et d'ou ce commentaire.
+    #
+    # Restent a redemarrer ici :
+    # - a la BASCULE du reglage global : le drop-in containers.conf.d est pose
+    #   APRES le commit (un conteneur ne doit pas repartir en lecture seule
+    #   sans ses tmpfs), donc le conteneur que le commit vient de relancer ne
+    #   l'a pas encore vu -- et ceux que le commit n'a pas touches non plus ;
+    # - tout conteneur touche HORS transaction (aucune ligne `set` a son nom) ;
+    # - tous, sur `-e force_restart=true` (filet : retrouver l'ancien
+    #   comportement sans toucher au code).
+    #
+    # Ce qu'on perd : l'etat final n'est plus produit par un redemarrage ordonne
+    # un-a-un, mais par celui du commit (les conteneurs dans l'ordre de VyOS).
+    # Assume : a chaque boot du routeur l'ordre est deja arbitraire. Ce qu'on
+    # garde : la VERIFICATION, jouee pour tous, redemarrage ou pas.
+    - name: "apply — conteneurs a redemarrer ou a verifier"
       ansible.builtin.set_fact:
         _a_redemarrer: "{{ _ordre | from_json }}"
       vars:
         _bascule: "{{ (_ro_actif and not _ro_dropin_stat.stat.exists) or (_ro_retire is changed) }}"
-        _touches: >-
-          {{ (_ro_routeur if _bascule
-              else ((_a_changer | map(attribute='nom') | list)
-                    + (_ro_a_poser | map(attribute='nom') | list)))
-             | unique | list }}
+        # Ceux que le commit vient de redemarrer : exactement les noms portes
+        # par une ligne `set` de la transaction. Vide quand il n'y a pas eu de
+        # commit (la tache est alors passee), donc tout le monde redemarre.
+        _par_le_commit: >-
+          {{ ((_a_changer | map(attribute='nom') | list)
+              + (_ro_a_poser | map(attribute='nom') | list)) | unique | list }}
+        _touches: "{{ (_ro_routeur if _bascule else _par_le_commit) | unique | list }}"
+        # L'image attendue, pour la verifier sur le conteneur qui tourne et pas
+        # seulement dans la configuration : `apply()` passe en SILENCE (continue)
+        # quand `podman image exists` echoue -- la ligne `set` est alors posee,
+        # commitee, et le conteneur tourne toujours l'ancienne image.
+        _images: >-
+          {{ dict(_a_changer | map(attribute='nom') | zip(_a_changer | map(attribute='voulue'))) }}
+        _force: "{{ force_restart | default(false) | bool }}"
         _ordre: >-
           {% set out = [] %}
-          {% for c in _ro_table %}{% if c.name in _touches %}{% set _ = out.append(c) %}{% endif %}{% endfor %}
-          {% for n in _touches %}{% if n not in _ro_noms_table %}{% set _ = out.append({'name': n}) %}{% endif %}{% endfor %}
+          {% for c in _ro_table %}{% if c.name in _touches %}{% set _ = out.append(c | combine({
+               'restart': _force or (_bascule | bool) or (c.name not in _par_le_commit),
+               'image': _images[c.name] | default('')})) %}{% endif %}{% endfor %}
+          {% for n in _touches %}{% if n not in _ro_noms_table %}{% set _ = out.append({'name': n,
+               'restart': _force or (_bascule | bool) or (n not in _par_le_commit),
+               'image': _images[n] | default('')}) %}{% endif %}{% endfor %}
           {{ out | to_json }}
       when: not ansible_check_mode
       tags: [apply]
 
-    # Un a la fois, verifie (en marche, ReadonlyRootfs conforme, meme date de
-    # demarrage 20 s plus tard) ; le premier qui ne tient pas arrete le run.
-    - name: "apply — redemarrer par systemd et verifier"
+    # Un a la fois : en marche, ReadonlyRootfs conforme, image attendue, meme
+    # date de demarrage un instant plus tard ; le premier qui ne tient pas
+    # arrete le run. Redemarrage seulement si la selection ci-dessus le demande.
+    - name: "apply — redemarrer si besoin, verifier dans tous les cas"
       ansible.builtin.include_tasks:
         file: tasks/readonly-restart-verify.yml
         apply:
@@ -615,6 +659,51 @@
       vars:
         _ro_attendu: "{{ _ro_actif }}"
       when: not ansible_check_mode
+      tags: [apply]
+
+    # Ce que le redemarrage garantissait de fait, et qu'il faut donc verifier
+    # maintenant qu'on ne le fait plus : les unites qui dependent d'un conteneur
+    # sont bien reparties avec lui. Cas concret et le seul ici, squid-redirect :
+    # `WantedBy=vyos-container-squid.service`, elle injecte les regles nft du
+    # proxy transparent DANS le netns du conteneur. Si elle ne repart pas, le
+    # proxy va tres bien, aucune sonde applicative ne bronche, et tout le VLAN
+    # perd HTTPS. `ActiveEnterTimestampMonotonic` au moins egal a celui du
+    # conteneur = elle a ete relancee par CE demarrage, pas par le precedent.
+    # Unite absente (autre installation) : on ne verifie rien.
+    - name: "apply — squid : la redirection transparente est repartie avec lui"
+      become: false
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          echo "$(systemctl show squid-redirect.service -p LoadState --value)|$(systemctl show squid-redirect.service -p ActiveState --value)|$(systemctl show squid-redirect.service -p ActiveEnterTimestampMonotonic --value)|$(systemctl show vyos-container-squid.service -p ActiveEnterTimestampMonotonic --value)"
+        executable: /bin/bash
+      register: _redirect
+      changed_when: false
+      when:
+        - "'squid' in (_a_redemarrer | default([]) | map(attribute='name') | list)"
+        - not ansible_check_mode
+      tags: [apply]
+
+    - name: "apply — squid : verifier la redirection transparente"
+      ansible.builtin.assert:
+        that:
+          - _etat.split('|')[1] == 'active'
+          - (_etat.split('|')[2] | int) >= (_etat.split('|')[3] | int)
+        fail_msg: >-
+          squid-redirect.service : etat « {{ _etat.split('|')[1] }} », demarree a
+          {{ _etat.split('|')[2] }} contre {{ _etat.split('|')[3] }} pour le
+          conteneur. Les regles nft
+          REDIRECT du proxy transparent ne sont pas en place : le VLAN
+          intercepte perd HTTPS sans qu'aucune sonde applicative ne bronche.
+          Reparer : `systemctl start squid-redirect.service` (unite posee par
+          proxy-deploy.yaml --tags redirect).
+        success_msg: "squid-redirect : {{ _etat.split('|')[1] }}, reposee avec le conteneur"
+        quiet: true
+      vars:
+        _etat: "{{ _redirect.stdout | trim }}"
+      when:
+        - _redirect is not skipped
+        - (_redirect.stdout | default('') | trim).split('|')[0] == 'loaded'
       tags: [apply]
 
     # Apres-montee propre a un service : quand SON image vient de changer, une
