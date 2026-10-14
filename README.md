@@ -349,7 +349,21 @@ temporairement `/usr/bin/suricata` pour contourner les file capabilities
 (`NET_ADMIN`) à l'exécution. `suricata-update` détecte normalement la
 version du moteur en exécutant ce binaire — sans lui, il retombe sur son
 défaut caché (`6.0.0`) et télécharge le mauvais ruleset ET Open. Le script
-passe donc `--suricata-version` explicitement, dérivé du tag de l'image.
+passe donc `--suricata-version` explicitement, dérivé du tag **de l'image du
+conteneur en service** (lue par `podman inspect` avant l'arrêt, pas écrite en
+dur : un tag figé dans le script a survécu à sa purge du registre et les règles
+sont restées gelées un mois, sans autre signal que le journal du script). Le
+dernier composant est retiré : les images taguées `<version>.<révision>`
+(`8.0.7.4`) ne sont pas comprises par `suricata-update`, qui attend `x.y.z`.
+
+**Gotcha `set -e` et le bilan de chargement** : le script attend dans le journal
+le `N rules successfully loaded, M rules failed` du moteur pour conclure. La
+substitution qui le cherche **doit** finir par `|| true` : `grep` sans
+correspondance rend 1, `pipefail` le propage, une affectation prend le code de sa
+substitution, et `set -e` tue alors le script au premier tour de la boucle
+d'attente. Le bilan arrivant environ 4 s après le démarrage et le premier sondage
+tombant à 5 s, la course se gagne presque toujours — et l'échec, rare, arrive
+quand les règles sont déjà à jour et le moteur en marche.
 
 **Adapter à ton réseau** : `suricata.yaml` utilise déjà des `HOME_NET`
 génériques (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`).
