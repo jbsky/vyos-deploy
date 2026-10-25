@@ -10,8 +10,13 @@
 # Les certificats Let's Encrypt (WWW/*.pem) sont geres separement (role
 # certbot ou equivalent) et ne sont PAS deployes par ce playbook.
 #
+# Les *.crt poses a cote de haproxy.cfg (certificats PUBLICS d'une CA, pour
+# `ca-file` sur une ligne `server ... ssl verify required`) sont deployes
+# avec la config : un `ca-file` absent empeche HAProxy de demarrer. Jamais
+# de cle privee ici -- les cles vivent dans WWW/, hors de ce depot.
+#
 # Tags disponibles :
-#   config   → copier haproxy.cfg + WWW.crt_list sur VyOS
+#   config   → copier haproxy.cfg + WWW.crt_list (+ les *.crt) sur VyOS
 #   service  → redemarrer le container haproxy
 #   check    → verifier que HAProxy repond
 #   cert_perms → resserrer les droits des cles TLS (haproxy_cert_restrict)
@@ -52,6 +57,19 @@
       tags: [config, service, check]
 
   tasks:
+    # AVANT haproxy.cfg : la config qui reference un ca-file ne doit jamais
+    # arriver sur le routeur avant le fichier qu'elle designe.
+    - name: Deploy backend CA certificates (*.crt)
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ haproxy_dest }}/{{ item | basename }}"
+        mode: "0644"
+      loop: "{{ query('ansible.builtin.fileglob', haproxy_conf + '/*.crt') }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      notify: Restart haproxy
+      tags: [config]
+
     # Pas de delegate_to/become explicite : ansible_become: true (host_vars)
     # s'applique par defaut, owner/group/mode directement sur copy donnent
     # aussi un vrai support --check/--diff.
