@@ -458,6 +458,7 @@
           sg vyattacfg -c '
           set -e
           source /etc/default/vyatta || true
+          [ -r /usr/share/vyos/vyos-configd-env-set ] && source /usr/share/vyos/vyos-configd-env-set || true
           W=/opt/vyatta/sbin/vyatta-cfg-cmd-wrapper
           $W begin
           {% for i in _a_changer %}
