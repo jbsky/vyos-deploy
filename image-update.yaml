@@ -837,8 +837,10 @@
           {%   for r in _references %}{% for n in noms %}
           {%     if n == r or n.endswith('/' ~ r) %}{% set ns.designee = true %}{% endif %}
           {%   endfor %}{% endfor %}
-          {%   if not ns.designee and (img.containers | default(0) | int) == 0 %}
-          {%     set _ = out.append({'id': img.id, 'noms': img.names | default([], true), 'taille': img.size | default(0)}) %}
+          {%   if not ns.designee and (img.containers | default(0) | int) == 0
+                  and (out | selectattr('id', 'equalto', img.id) | list | length) == 0 %}
+          {%     set _ = out.append({'id': img.id, 'noms': img.names | default([], true), 'taille': img.size | default(0),
+                                     'cibles': (img.names | default([], true)) or [img.id]}) %}
           {%   endif %}
           {% endfor %}
           {{ out | to_json }}
@@ -863,13 +865,20 @@
           {%- for i in _a_purger %}{{ ' : ' if loop.first else ', ' }}{{ (i.noms | join(' ')) or '<sans nom>' }} ({{ i.id[:12] }}){% endfor %}
       tags: [prune, never]
 
+    # Par NOM (`repo:tag`), un appel par tag, et non par identifiant : une
+    # image qui porte plusieurs tags (le cas de toutes les images de
+    # remplacement a contenu identique) est refusee par
+    # `podman image rm <id>` -- « more than one tag, please force removal »
+    # -- et l'op-mode n'expose pas `--force`. Pire, le wrapper rend alors 0 :
+    # la tache sortait verte sans rien supprimer (run 1366, 2026-11-11, 26
+    # images annoncees, aucune retiree). Retirer les tags un a un fait
+    # disparaitre l'image au dernier. Une image sans nom ne se designe que
+    # par son identifiant (`cibles`).
     - name: "prune — supprimer"
       become: false
       ansible.builtin.command:
-        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper delete container image {{ item.id }}"
-      loop: "{{ _a_purger }}"
-      loop_control:
-        label: "{{ (item.noms | join(' ')) or item.id[:12] }}"
+        cmd: "/opt/vyatta/bin/vyatta-op-cmd-wrapper delete container image {{ item }}"
+      loop: "{{ _a_purger | map(attribute='cibles') | flatten | unique | list }}"
       changed_when: true
       when: not ansible_check_mode
       tags: [prune, never]
@@ -884,6 +893,23 @@
         cmd: /opt/vyatta/bin/vyatta-op-cmd-wrapper show container image json
       register: _prune_apres
       changed_when: false
+      when:
+        - not ansible_check_mode
+        - _a_purger | length > 0
+      tags: [prune, never]
+
+    # Le wrapper rend 0 meme quand il refuse : seule la relecture prouve.
+    - name: "prune — chaque image purgee a disparu"
+      ansible.builtin.assert:
+        that: _restantes | length == 0
+        fail_msg: >-
+          Images toujours presentes apres la suppression : {{ _restantes | join(', ') }}.
+          `delete container image` rend 0 meme quand il refuse.
+        success_msg: "{{ _a_purger | length }} image(s) supprimee(s)"
+        quiet: true
+      vars:
+        _ids_apres: "{{ _prune_apres.stdout | from_json | map(attribute='id') | list }}"
+        _restantes: "{{ _a_purger | map(attribute='id') | select('in', _ids_apres) | list }}"
       when:
         - not ansible_check_mode
         - _a_purger | length > 0
